@@ -1,9 +1,13 @@
 package xchain
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"fmt"
 	"math"
 	"strings"
+
+	"github.com/btcsuite/btcd/txscript"
 )
 
 // Chain wraps an RPC client with the higher-level operations a swap leg needs
@@ -159,6 +163,142 @@ func (c *Chain) Confirmations(txid string) (int, error) {
 	return tx.Confirmations, nil
 }
 
+// TxConfirmations returns a tx's confirmation count via getrawtransaction, which
+// (unlike gettransaction) works for txs the local wallet did not create — e.g.
+// the taker-funded BTC leg the maker must verify. Returns 0 if unconfirmed.
+func (c *Chain) TxConfirmations(txid string) (int, error) {
+	var raw struct {
+		Confirmations int `json:"confirmations"`
+	}
+	if err := c.rpc.Call(&raw, "getrawtransaction", txid, true); err != nil {
+		return 0, err
+	}
+	return raw.Confirmations, nil
+}
+
+// ChainOutput is a tx output's value/asset/scriptPubKey, as the maker needs it
+// to verify the taker's BTC-leg funding.
+type ChainOutput struct {
+	ValueAtoms      uint64
+	AssetID         string
+	ScriptPubKeyHex string
+}
+
+// OutputAt returns the (txid, vout) output of any on-chain tx.
+func (c *Chain) OutputAt(txid string, vout uint32) (*ChainOutput, error) {
+	var raw struct {
+		Vout []struct {
+			Value        float64 `json:"value"`
+			Asset        string  `json:"asset"`
+			N            uint32  `json:"n"`
+			ScriptPubKey struct {
+				Hex string `json:"hex"`
+			} `json:"scriptPubKey"`
+		} `json:"vout"`
+	}
+	if err := c.rpc.Call(&raw, "getrawtransaction", txid, true); err != nil {
+		return nil, err
+	}
+	for _, v := range raw.Vout {
+		if v.N == vout {
+			return &ChainOutput{
+				ValueAtoms:      coinsToAtoms(v.Value),
+				AssetID:         v.Asset,
+				ScriptPubKeyHex: v.ScriptPubKey.Hex,
+			}, nil
+		}
+	}
+	return nil, fmt.Errorf("tx %s has no vout %d", txid, vout)
+}
+
+// AddressScriptPubKey returns the hex scriptPubKey the node derives for an
+// address (used to match the HTLC P2SH against the funded output).
+func (c *Chain) AddressScriptPubKey(addr string) (string, error) {
+	var va struct {
+		ScriptPubKey string `json:"scriptPubKey"`
+	}
+	if err := c.rpc.Call(&va, "validateaddress", addr); err != nil {
+		return "", err
+	}
+	return va.ScriptPubKey, nil
+}
+
+// SpenderOf reports the txid that spent the given outpoint, or "" if it is still
+// unspent. The maker uses this to detect the taker's SEQ-leg claim: when the
+// SEQ-leg output is spent, the spender's scriptSig carries the preimage.
+//
+// It uses gettxout (which returns null once an outpoint is spent) to learn that
+// a spend happened, then scans the mempool + recent blocks for the spender.
+func (c *Chain) SpenderOf(txid string, vout uint32) (string, error) {
+	// gettxout returns null for spent (and unknown) outputs; a non-null result
+	// means the outpoint is still in the UTXO set, i.e. NOT yet claimed.
+	var utxo *struct {
+		Confirmations int `json:"confirmations"`
+	}
+	if err := c.rpc.Call(&utxo, "gettxout", txid, vout, true); err != nil {
+		return "", err
+	}
+	if utxo != nil {
+		return "", nil // still unspent: not claimed yet
+	}
+
+	// Spent. Find the spender: check the mempool first, then walk back from the
+	// tip until we find the tx whose input references (txid, vout).
+	spends := func(spenderTxid string) (bool, error) {
+		var raw struct {
+			Vin []struct {
+				TxID string `json:"txid"`
+				Vout uint32 `json:"vout"`
+			} `json:"vin"`
+		}
+		if err := c.rpc.Call(&raw, "getrawtransaction", spenderTxid, true); err != nil {
+			return false, nil // ignore txs we cannot fetch
+		}
+		for _, in := range raw.Vin {
+			if in.TxID == txid && in.Vout == vout {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+
+	// 1) mempool.
+	var mempool []string
+	if err := c.rpc.Call(&mempool, "getrawmempool"); err == nil {
+		for _, mt := range mempool {
+			if ok, _ := spends(mt); ok {
+				return mt, nil
+			}
+		}
+	}
+
+	// 2) recent blocks (most recent first). The claim is expected within a few
+	// blocks on regtest; scan a bounded window.
+	height, err := c.BlockCount()
+	if err != nil {
+		return "", err
+	}
+	const scanWindow = 50
+	for h := height; h >= 0 && h > height-scanWindow; h-- {
+		var bh string
+		if err := c.rpc.Call(&bh, "getblockhash", h); err != nil {
+			break
+		}
+		var blk struct {
+			Tx []string `json:"tx"`
+		}
+		if err := c.rpc.Call(&blk, "getblock", bh); err != nil {
+			continue
+		}
+		for _, bt := range blk.Tx {
+			if ok, _ := spends(bt); ok {
+				return bt, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("outpoint %s:%d is spent but spender not found in mempool or last %d blocks", txid, vout, scanWindow)
+}
+
 // RedeemScriptSigContains reports whether the given on-chain spend's input 0
 // scriptSig asm contains the hex needle (used to prove the preimage was
 // revealed on-chain, so the counterparty can read it).
@@ -180,6 +320,60 @@ func (c *Chain) RedeemScriptSigContains(txid, needleHex string) (bool, string, e
 	asm := raw.Vin[0].ScriptSig.Asm
 	hexv := raw.Vin[0].ScriptSig.Hex
 	return strings.Contains(asm, needleHex) || strings.Contains(hexv, needleHex), asm, nil
+}
+
+// ExtractPreimage reads the preimage off a redeem spend's input-0 scriptSig.
+// This is the maker's secret-extraction step: the daemon watches the SEQ chain
+// for the taker's claim, then recovers the preimage `s` (the data push whose
+// sha256 equals the swap's hashlock H) so it can claim the BTC leg with it.
+//
+// It tokenizes every input's scriptSig and returns the first pushed data item
+// whose SHA256 equals wantHash. Returning the raw bytes (rather than a
+// contains-check) is what lets the maker actually USE the secret.
+func (c *Chain) ExtractPreimage(txid string, wantHash []byte) ([]byte, error) {
+	var raw struct {
+		Vin []struct {
+			ScriptSig struct {
+				Hex string `json:"hex"`
+			} `json:"scriptSig"`
+		} `json:"vin"`
+	}
+	if err := c.rpc.Call(&raw, "getrawtransaction", txid, true); err != nil {
+		return nil, err
+	}
+	for _, vin := range raw.Vin {
+		if vin.ScriptSig.Hex == "" {
+			continue
+		}
+		sig, err := fromHex(vin.ScriptSig.Hex)
+		if err != nil {
+			continue
+		}
+		items, err := pushedData(sig)
+		if err != nil {
+			continue
+		}
+		for _, it := range items {
+			h := sha256.Sum256(it)
+			if bytes.Equal(h[:], wantHash) {
+				return it, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("preimage for hash %s not found in tx %s scriptSig", toHex(wantHash), txid)
+}
+
+// pushedData tokenizes a scriptSig and returns its data pushes (in order),
+// skipping opcodes. Used by ExtractPreimage to scan for the preimage.
+func pushedData(script []byte) ([][]byte, error) {
+	tok := txscript.MakeScriptTokenizer(0, script)
+	var out [][]byte
+	for tok.Next() {
+		if d := tok.Data(); d != nil {
+			out = append(out, d)
+		}
+	}
+	return out, tok.Err()
 }
 
 // --- anchor metadata (Sequentia leg only) ---
@@ -225,6 +419,24 @@ func (c *Chain) BlockHashOfTx(txid string) (string, error) {
 		return "", fmt.Errorf("tx %s is not confirmed (no blockhash)", txid)
 	}
 	return tx.BlockHash, nil
+}
+
+// AssetBalance returns the wallet's confirmed balance of an asset, in atoms.
+// assetID may be "" to query the default pegged "bitcoin" asset (the BTC leg's
+// reserve). For an issued SEQ asset, pass its hex id. Uses getbalance with an
+// explicit asset to avoid pulling in confidential-balance machinery.
+func (c *Chain) AssetBalance(assetID string) (uint64, error) {
+	// getbalance "*" minconf include_watchonly avoid_reuse assetlabel
+	// The Elements RPC accepts the asset id directly as the assetlabel arg.
+	asset := assetID
+	if asset == "" {
+		asset = "bitcoin"
+	}
+	var bal float64
+	if err := c.rpc.Call(&bal, "getbalance", "*", 1, false, false, asset); err != nil {
+		return 0, err
+	}
+	return coinsToAtoms(bal), nil
 }
 
 // PeggedAsset returns the chain's pegged "bitcoin" asset id (used as the BTC
