@@ -1,0 +1,279 @@
+{
+  "swagger": "2.0",
+  "info": {
+    "title": "tdex-daemon/v2/webhook.proto",
+    "version": "version not set"
+  },
+  "tags": [
+    {
+      "name": "WebhookService"
+    }
+  ],
+  "consumes": [
+    "application/json"
+  ],
+  "produces": [
+    "application/json"
+  ],
+  "paths": {
+    "/v2/admin/webhook": {
+      "post": {
+        "summary": "Adds a webhook registered for some kind of event.",
+        "operationId": "WebhookService_AddWebhook",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v2AddWebhookResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/v2AddWebhookRequest"
+            }
+          }
+        ],
+        "tags": [
+          "WebhookService"
+        ]
+      }
+    },
+    "/v2/admin/webhook/drop": {
+      "post": {
+        "summary": "Removes some previously added webhook.",
+        "operationId": "WebhookService_RemoveWebhook",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v2RemoveWebhookResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/v2RemoveWebhookRequest"
+            }
+          }
+        ],
+        "tags": [
+          "WebhookService"
+        ]
+      }
+    },
+    "/v2/admin/webhooks": {
+      "get": {
+        "summary": "Returns registered webhooks",
+        "operationId": "WebhookService_ListWebhooks2",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v2ListWebhooksResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "event",
+            "description": "Filter the list of webhooks by event.",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "enum": [
+              "WEBHOOK_EVENT_UNSPECIFIED",
+              "WEBHOOK_EVENT_TRADE_SETTLED",
+              "WEBHOOK_EVENT_ACCOUNT_LOW_BALANCE",
+              "WEBHOOK_EVENT_ACCOUNT_WITHDRAW",
+              "WEBHOOK_EVENT_ACCOUNT_DEPOSIT",
+              "WEBHOOK_EVENT_ANY"
+            ],
+            "default": "WEBHOOK_EVENT_UNSPECIFIED"
+          }
+        ],
+        "tags": [
+          "WebhookService"
+        ]
+      }
+    },
+    "/v2/admin/webhooks/{event}": {
+      "get": {
+        "summary": "Returns registered webhooks",
+        "operationId": "WebhookService_ListWebhooks",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v2ListWebhooksResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "event",
+            "description": "Filter the list of webhooks by event.",
+            "in": "path",
+            "required": true,
+            "type": "string",
+            "enum": [
+              "WEBHOOK_EVENT_UNSPECIFIED",
+              "WEBHOOK_EVENT_TRADE_SETTLED",
+              "WEBHOOK_EVENT_ACCOUNT_LOW_BALANCE",
+              "WEBHOOK_EVENT_ACCOUNT_WITHDRAW",
+              "WEBHOOK_EVENT_ACCOUNT_DEPOSIT",
+              "WEBHOOK_EVENT_ANY"
+            ]
+          }
+        ],
+        "tags": [
+          "WebhookService"
+        ]
+      }
+    }
+  },
+  "definitions": {
+    "protobufAny": {
+      "type": "object",
+      "properties": {
+        "@type": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": {}
+    },
+    "rpcStatus": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "message": {
+          "type": "string"
+        },
+        "details": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/protobufAny"
+          }
+        }
+      }
+    },
+    "v2AddWebhookRequest": {
+      "type": "object",
+      "properties": {
+        "endpoint": {
+          "type": "string",
+          "description": "The endpoint of the webhook to call whenever the target event occurs."
+        },
+        "event": {
+          "$ref": "#/definitions/v2WebhookEvent",
+          "description": "The event for which the webhook endpoint should be called."
+        },
+        "secret": {
+          "type": "string",
+          "description": "The secret to use to generate an OAuth token for making authenticated\nrequests to the webhook endpoint."
+        }
+      }
+    },
+    "v2AddWebhookResponse": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "The id of the new webhook."
+        }
+      }
+    },
+    "v2ListWebhooksResponse": {
+      "type": "object",
+      "properties": {
+        "webhookInfo": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/v2WebhookInfo"
+          },
+          "description": "The list of info about the webhooks."
+        }
+      }
+    },
+    "v2RemoveWebhookRequest": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "The id of the webhook to remove."
+        }
+      }
+    },
+    "v2RemoveWebhookResponse": {
+      "type": "object"
+    },
+    "v2WebhookEvent": {
+      "type": "string",
+      "enum": [
+        "WEBHOOK_EVENT_UNSPECIFIED",
+        "WEBHOOK_EVENT_TRADE_SETTLED",
+        "WEBHOOK_EVENT_ACCOUNT_LOW_BALANCE",
+        "WEBHOOK_EVENT_ACCOUNT_WITHDRAW",
+        "WEBHOOK_EVENT_ACCOUNT_DEPOSIT",
+        "WEBHOOK_EVENT_ANY"
+      ],
+      "default": "WEBHOOK_EVENT_UNSPECIFIED"
+    },
+    "v2WebhookInfo": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "The id of the webhook."
+        },
+        "endpoint": {
+          "type": "string",
+          "description": "The endpoint of the external service to reach."
+        },
+        "isSecured": {
+          "type": "boolean",
+          "description": "Whether the outgoing requests are authenticated."
+        },
+        "event": {
+          "$ref": "#/definitions/v2WebhookEvent",
+          "description": "The target event for which the webhook endpoint is called."
+        }
+      }
+    }
+  }
+}
