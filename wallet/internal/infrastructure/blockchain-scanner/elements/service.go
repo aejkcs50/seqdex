@@ -201,8 +201,16 @@ func (s *service) GetUtxos(utxoList []domain.Utxo) ([]domain.Utxo, error) {
 	for _, u := range utxoList {
 		key := u.UtxoKey
 		addr := addressFromScript(u.Script, s.args.network())
+		// rescan=false. importaddress defaults rescan=true, which rescans the WHOLE
+		// chain from genesis for the address — minutes on a long, anchor-validated
+		// chain, long enough that TradePropose's GetUtxos call times out (the maker
+		// then reports "service is unavailable, retry later"). It's also needless: the
+		// scanner already imported these addresses (with a rescan) and detected these
+		// very UTXOs when the deposits landed, so the txs are already in the node
+		// wallet. Re-importing here only needs to (re)assert the watch, not re-scan
+		// history, so gettransaction below still resolves immediately.
 		if _, err := s.rpcClient.call(
-			"importaddress", []interface{}{addr},
+			"importaddress", []interface{}{addr, "", false},
 		); err != nil {
 			return nil, err
 		}
