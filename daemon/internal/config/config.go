@@ -63,6 +63,13 @@ const (
 	OceanWalletAddrKey = "WALLET_ADDR"
 	// DBTypeKey is used to switch database type between those supported
 	DBTypeKey = "DB_TYPE"
+	// NodeRpcKey is an optional Sequentia ("elements") node JSON-RPC url
+	// (http://user:pass@host:port) the daemon uses to read the open fee-market
+	// exchange rates (getfeeexchangerates) so same-chain swaps can pay the
+	// network fee in the transacted asset, valued native-equivalent. When unset,
+	// swaps fall back to paying the network fee in the native asset from the fee
+	// account (legacy behavior). Env: SEQDEX_NODE_RPC.
+	NodeRpcKey = "NODE_RPC"
 
 	// --- Cross-chain (XchainService) maker config ---
 	// The integrated cross-chain swap maker is enabled only when

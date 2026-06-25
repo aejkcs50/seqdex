@@ -25,6 +25,6 @@ type WalletService interface {
 	Close()
 }
 
-func NewWalletService(w ports.WalletService) (WalletService, error) {
-	return wallet.NewService(w)
+func NewWalletService(w ports.WalletService, nodeRPC string) (WalletService, error) {
+	return wallet.NewService(w, nodeRPC)
 }

@@ -44,7 +44,7 @@ var (
 	noMacaroons, noOperatorTls, profilerEnabled            bool
 	datadir, dbDir, profilerDir, tradeTLSKey, tradeTLSCert string
 	walletUnlockPasswordFile, dbType, oceanWalletAddr      string
-	connectAddr, connectProto                              string
+	connectAddr, connectProto, nodeRPC                     string
 	operatorTLSExtraIPs, operatorTLSExtraDomains           []string
 	// App services config
 	feeBalanceThreshold                   uint64
@@ -104,6 +104,7 @@ func main() {
 		TxSatsPerByte:       satsPerByte,
 		DBType:              dbType,
 		DBConfig:            dbDir,
+		NodeRPC:             nodeRPC,
 	}
 
 	// Optionally build the integrated cross-chain swap maker (XchainService).
@@ -172,6 +173,7 @@ func loadConfig() error {
 	tradeSvcPort = config.GetInt(config.TradeListeningPortKey)
 	operatorSvcPort = config.GetInt(config.OperatorListeningPortKey)
 	oceanWalletAddr = config.GetString(config.OceanWalletAddrKey)
+	nodeRPC = config.GetString(config.NodeRpcKey)
 	// Cross-chain maker config (only used when XCHAIN_PARENT_RPC is set).
 	xchainParentRPC = config.GetString(config.XchainParentRPCKey)
 	xchainParentKind = config.GetString(config.XchainParentKindKey)

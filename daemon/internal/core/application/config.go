@@ -27,6 +27,11 @@ type Config struct {
 	FeeBalanceThreshold uint64
 	TradePriceSlippage  decimal.Decimal
 	TxSatsPerByte       decimal.Decimal
+	// NodeRPC is an optional Sequentia node JSON-RPC url
+	// (http://user:pass@host:port) used to read open fee-market exchange rates
+	// so same-chain swaps can pay the network fee in the transacted asset. Empty
+	// disables the open fee market (fees fall back to the native asset).
+	NodeRPC string
 
 	repo     ports.RepoManager
 	pubsub   PubSubService
@@ -105,7 +110,7 @@ func (c *Config) pubsubService() (PubSubService, error) {
 
 func (c *Config) walletService() (WalletService, error) {
 	if c.wallet == nil {
-		wallet, err := NewWalletService(c.OceanWallet)
+		wallet, err := NewWalletService(c.OceanWallet, c.NodeRPC)
 		if err != nil {
 			return nil, err
 		}

@@ -18,11 +18,20 @@ type Service struct {
 	wallet     ports.WalletService
 	staticInfo ports.WalletInfo
 
+	// rates resolves open-fee-market exchange rates so same-chain swaps can pay
+	// the network fee in the transacted asset. Nil when no node RPC is
+	// configured, in which case swaps fall back to the native fee asset.
+	rates feeRateProvider
+
 	txNotificationHandlers   txNotificationQueue
 	utxoNotificationHandlers utxoNotificationQueue
 }
 
-func NewService(wallet ports.WalletService) (*Service, error) {
+// NewService builds the wallet service. nodeRPC is an optional Sequentia node
+// JSON-RPC url (http://user:pass@host:port) used to read the open fee-market
+// exchange rates; when empty, the open fee market is disabled and swaps pay the
+// network fee in the native asset (legacy behavior).
+func NewService(wallet ports.WalletService, nodeRPC string) (*Service, error) {
 	if wallet == nil {
 		return nil, fmt.Errorf("missing ocean wallet service")
 	}
@@ -31,6 +40,18 @@ func NewService(wallet ports.WalletService) (*Service, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to ocean wallet: %s", err)
 	}
+
+	var rates feeRateProvider
+	if nodeRPC != "" {
+		nr, err := newNodeFeeRates(nodeRPC)
+		if err != nil {
+			return nil, fmt.Errorf("failed to init fee-rate provider: %s", err)
+		}
+		if nr != nil {
+			rates = nr
+		}
+	}
+
 	txHandlers := txNotificationQueue{
 		&sync.Mutex{}, make([]func(ports.WalletTxNotification) bool, 0),
 	}
@@ -38,7 +59,7 @@ func NewService(wallet ports.WalletService) (*Service, error) {
 		&sync.Mutex{}, make([]func(ports.WalletUtxoNotification) bool, 0),
 	}
 
-	svc := &Service{wallet, info, txHandlers, utxoHandlers}
+	svc := &Service{wallet, info, rates, txHandlers, utxoHandlers}
 	go svc.listenToTxNotifications()
 	go svc.listenToUtxoNotifications()
 
@@ -303,9 +324,31 @@ func (s *Service) CompleteSwap(
 
 	// 150 is an over estimation of an extra confidential output (change).
 	dummyFeeAmount += 150
-	lbtc := s.staticInfo.GetNativeAsset()
+
+	// Open fee market: pay the network fee in the asset already being
+	// transacted (assetR), valued native-equivalent, rather than always
+	// subsidising it in the native asset from the fee account. No asset is
+	// privileged. If assetR isn't fee-eligible (not on the node's whitelist, or
+	// no node RPC configured), fall back to the native asset + fee account so
+	// swaps never break.
+	nativeAsset := s.staticInfo.GetNativeAsset()
+	feeAssetNet := swapRequest.GetAssetR()
+	feeRate, eligible := s.feeExchangeRate(feeAssetNet)
+	feeFundAccount := account
+	if !eligible {
+		feeAssetNet = nativeAsset
+		feeRate = exchangeRateScale
+		feeFundAccount = domain.FeeAccount
+	} else if feeAssetNet == nativeAsset {
+		// Preserve today's behavior: the native fee is funded from the
+		// dedicated fee account, not the market account.
+		feeFundAccount = domain.FeeAccount
+	}
+
+	// Convert the required native-equivalent fee into feeAssetNet (round UP).
+	dummyFeeInAsset := feeInAsset(dummyFeeAmount, feeRate)
 	feeUtxos, change, _, err := txManager.SelectUtxos(
-		ctx, domain.FeeAccount, lbtc, dummyFeeAmount,
+		ctx, feeFundAccount, feeAssetNet, dummyFeeInAsset,
 	)
 	if err != nil {
 		return "", nil, -1, err
@@ -315,17 +358,18 @@ func (s *Service) CompleteSwap(
 		txid, _ := elementsutil.TxIDToBytes(u.GetTxid())
 		inputs = append(inputs, input{txid, u.GetIndex(), u.GetScript(), 0, 0})
 	}
-	feeAmount := dummyFeeAmount
+	feeAmount := dummyFeeAmount     // native-equivalent fee (atoms)
+	feeNetAmount := dummyFeeInAsset // fee vout value, denominated in feeAssetNet
 	if change > 0 {
 		addresses, err := accountManager.DeriveChangeAddresses(
-			ctx, domain.FeeAccount, 1,
+			ctx, feeFundAccount, 1,
 		)
 		if err != nil {
 			return "", nil, -1, err
 		}
 		info, _ := seqnet.FromConfidential(addresses[0], &net)
 		outputs = append(outputs, output{
-			lbtc, change, hex.EncodeToString(info.Script),
+			feeAssetNet, change, hex.EncodeToString(info.Script),
 			hex.EncodeToString(info.BlindingKey),
 		})
 
@@ -337,18 +381,21 @@ func (s *Service) CompleteSwap(
 		if err != nil {
 			return "", nil, -1, err
 		}
+		feeNetAmount = feeInAsset(feeAmount, feeRate)
 
 		changeOut := outputs[len(outputs)-1]
 		changeOutScript := changeOut.(output).script
 		changeOutBlindKey := changeOut.(output).blindKey
-		diff := dummyFeeAmount - feeAmount
+		// Refund the over-estimation (in feeAssetNet) back to the change output.
+		diff := dummyFeeInAsset - feeNetAmount
 		amount := changeOut.GetAmount() + diff
 		outputs[len(outputs)-1] = output{
 			changeOut.GetAsset(), amount, changeOutScript, changeOutBlindKey,
 		}
 	}
 
-	outputs = append(outputs, output{lbtc, feeAmount, "", ""})
+	// Exactly one explicit/unblinded Elements fee output, in feeAssetNet.
+	outputs = append(outputs, output{feeAssetNet, feeNetAmount, "", ""})
 
 	pset, err := txManager.UpdatePset(
 		ctx, swapRequest.GetTransaction(), inputs, outputs,
