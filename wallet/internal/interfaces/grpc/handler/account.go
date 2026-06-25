@@ -4,9 +4,10 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/vulpemventures/go-elements/address"
 	pb "github.com/aejkcs50/seqdex/wallet/api-spec/protobuf/gen/go/ocean/v1"
+	"github.com/aejkcs50/seqdex/wallet/internal/config"
 	"github.com/aejkcs50/seqdex/wallet/internal/core/application"
+	"github.com/aejkcs50/seqdex/wallet/pkg/seqnet"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -175,9 +176,10 @@ func (a *account) ListUtxos(
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	addresses := req.GetAddresses()
+	net := config.GetNetwork()
 	scripts := make([][]byte, 0, len(addresses))
 	for _, addr := range addresses {
-		script, err := address.ToOutputScript(addr)
+		script, err := seqnet.ToOutputScript(addr, net)
 		if err != nil {
 			return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("invalid address %s", addr))
 		}

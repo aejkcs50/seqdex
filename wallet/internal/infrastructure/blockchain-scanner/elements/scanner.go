@@ -1,6 +1,7 @@
 package elements_scanner
 
 import (
+	"bytes"
 	"encoding/hex"
 	"fmt"
 	"sync"
@@ -17,10 +18,36 @@ import (
 	"github.com/aejkcs50/seqdex/wallet/internal/core/domain"
 )
 
+// unspentWatchItem is a scanner.WatchItem that matches an output by its exact
+// output script. It replaces scanner.NewUnspentWatchItemFromAddress, whose
+// internal address.ToOutputScript hardcodes the Liquid network HRPs and so
+// silently returns a nil item for Sequentia addresses (causing a nil-pointer
+// panic in the scanner). We build the item directly from the wallet-derived
+// output script, which is HRP-agnostic.
+type unspentWatchItem struct {
+	outputScript []byte
+}
+
+func (u *unspentWatchItem) Bytes() []byte { return u.outputScript }
+
+func (u *unspentWatchItem) Match(tx *transaction.Transaction) bool {
+	for _, out := range tx.Outputs {
+		if bytes.Equal(u.outputScript, out.Script) {
+			return true
+		}
+	}
+	return false
+}
+
+func (u *unspentWatchItem) EventType() scanner.EventType {
+	return scanner.UnspentUtxo
+}
+
 type scannerService struct {
 	accountName         string
 	svc                 scanner.Service
 	blindingKeys        map[string][]byte
+	watchedScripts      map[string][]byte // script hex -> decoded output script
 	startingBlockHeight uint32
 	chTxs               chan *domain.Transaction
 	chUtxos             chan []*domain.Utxo
@@ -49,6 +76,7 @@ func newScannerSvc(
 		accountName:         accountName,
 		svc:                 scanner.New(filtersDb, headersDb, blockSvc, genesisHash),
 		blindingKeys:        make(map[string][]byte),
+		watchedScripts:      make(map[string][]byte),
 		startingBlockHeight: startingBlockHeight,
 		chTxs:               make(chan *domain.Transaction, 10),
 		chUtxos:             make(chan []*domain.Utxo, 10),
@@ -78,15 +106,42 @@ func (s *scannerService) watchAddresses(addressesInfo []domain.AddressInfo) {
 		}
 
 		s.blindingKeys[info.Script] = info.BlindingKey
-		item, _ := scanner.NewUnspentWatchItemFromAddress(info.Address)
+		script, err := hex.DecodeString(info.Script)
+		if err != nil || len(script) == 0 {
+			s.warn(err, "skip watching address with invalid script %q", info.Script)
+			continue
+		}
+		s.watchedScripts[info.Script] = script
 		s.svc.Watch(
-			scanner.WithWatchItem(item),
+			scanner.WithWatchItem(&unspentWatchItem{outputScript: script}),
 			scanner.WithStartBlock(s.startingBlockHeight),
 			scanner.WithPersistentWatch(),
 		)
 		s.log(
 			"start watching address %s for account %s",
 			info.DerivationPath, s.accountName,
+		)
+	}
+}
+
+// rescanFrom re-arms all watched addresses starting at the given block height,
+// waking the scanner queue so that blocks appended after the initial watch are
+// scanned. Overlapping rescans are harmless: UTXO storage is keyed by txid:vout.
+func (s *scannerService) rescanFrom(fromHeight uint32) {
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+
+	for _, script := range s.watchedScripts {
+		s.svc.Watch(
+			scanner.WithWatchItem(&unspentWatchItem{outputScript: script}),
+			scanner.WithStartBlock(fromHeight),
+			scanner.WithPersistentWatch(),
+		)
+	}
+	if len(s.watchedScripts) > 0 {
+		s.log(
+			"rescan %d address(es) from block %d for account %s",
+			len(s.watchedScripts), fromHeight, s.accountName,
 		)
 	}
 }

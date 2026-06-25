@@ -13,6 +13,8 @@ import (
 	appconfig "github.com/aejkcs50/seqdex/wallet/internal/app-config"
 	"github.com/aejkcs50/seqdex/wallet/internal/config"
 	electrum_scanner "github.com/aejkcs50/seqdex/wallet/internal/infrastructure/blockchain-scanner/electrum"
+	elements_scanner "github.com/aejkcs50/seqdex/wallet/internal/infrastructure/blockchain-scanner/elements"
+	neutrino_scanner "github.com/aejkcs50/seqdex/wallet/internal/infrastructure/blockchain-scanner/neutrino"
 	postgresdb "github.com/aejkcs50/seqdex/wallet/internal/infrastructure/storage/db/postgres"
 	"github.com/aejkcs50/seqdex/wallet/internal/interfaces"
 	grpc_interface "github.com/aejkcs50/seqdex/wallet/internal/interfaces/grpc"
@@ -38,6 +40,9 @@ var (
 	tlsDir             = filepath.Join(datadir, config.TLSLocation)
 	profilerDir        = filepath.Join(datadir, config.ProfilerLocation)
 	electrumUrl        = config.GetString(config.ElectrumUrlKey)
+	elementsRpcAddr    = config.GetString(config.ElementsNodeRpcAddrKey)
+	esploraUrl         = config.GetString(config.EsploraUrlKey)
+	nodePeers          = config.GetStringSlice(config.NodePeersKey)
 	tlsExtraIPs        = config.GetStringSlice(config.TLSExtraIPKey)
 	tlsExtraDomains    = config.GetStringSlice(config.TLSExtraDomainKey)
 	statsInterval      = time.Duration(config.GetInt(config.StatsIntervalKey)) * time.Second
@@ -71,10 +76,7 @@ func main() {
 		defer profilerSvc.Stop()
 	}
 
-	bcScannerConfig := electrum_scanner.ServiceArgs{
-		Addr:    electrumUrl,
-		Network: network,
-	}
+	bcScannerConfig := buildScannerConfig()
 	serviceCfg := grpc_interface.ServiceConfig{
 		Port:         port,
 		NoTLS:        noTLS,
@@ -112,6 +114,36 @@ func main() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
 	<-sigChan
+}
+
+// buildScannerConfig assembles the blockchain-scanner config args matching the
+// configured scanner type. app-config type-asserts on the concrete type, so it
+// must match BlockchainScannerType exactly.
+func buildScannerConfig() interface{} {
+	scannerDir := filepath.Join(datadir, config.ScannerLocation)
+	switch bcScannerType {
+	case "elements":
+		return elements_scanner.ServiceArgs{
+			RpcAddr:    elementsRpcAddr,
+			Network:    network.Name,
+			EsploraUrl: esploraUrl, // optional; empty => node-RPC-only mode
+		}
+	case "neutrino":
+		return neutrino_scanner.NodeServiceArgs{
+			Network:             network.Name,
+			FiltersDatadir:      filepath.Join(scannerDir, "filters"),
+			BlockHeadersDatadir: filepath.Join(scannerDir, "headers"),
+			EsploraUrl:          esploraUrl,
+			Peers:               nodePeers,
+		}
+	case "electrum":
+		fallthrough
+	default:
+		return electrum_scanner.ServiceArgs{
+			Addr:    electrumUrl,
+			Network: network,
+		}
+	}
 }
 
 func dbConfigFromType() interface{} {

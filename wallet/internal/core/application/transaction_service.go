@@ -13,13 +13,13 @@ import (
 	"github.com/btcsuite/btcd/txscript"
 	log "github.com/sirupsen/logrus"
 	"github.com/vulpemventures/go-bip32"
-	"github.com/vulpemventures/go-elements/address"
 	"github.com/vulpemventures/go-elements/elementsutil"
 	"github.com/vulpemventures/go-elements/network"
 	"github.com/vulpemventures/go-elements/psetv2"
 	"github.com/vulpemventures/go-elements/transaction"
 	"github.com/aejkcs50/seqdex/wallet/internal/core/domain"
 	"github.com/aejkcs50/seqdex/wallet/internal/core/ports"
+	"github.com/aejkcs50/seqdex/wallet/pkg/seqnet"
 	wallet "github.com/aejkcs50/seqdex/wallet/pkg/wallet"
 	singlesig "github.com/aejkcs50/seqdex/wallet/pkg/wallet/single-sig"
 )
@@ -458,7 +458,9 @@ func (ts *TransactionService) Transfer(
 			script, _ := hex.DecodeString(addressesInfo[i].Script)
 			var blindingKey []byte
 			if !account.Unconf {
-				addr, _ := address.FromConfidential(addressesInfo[i].Address)
+				addr, _ := seqnet.FromConfidential(
+					addressesInfo[i].Address, ts.network,
+				)
 				blindingKey = addr.BlindingKey
 			}
 			changeOutputs = append(changeOutputs, wallet.Output{

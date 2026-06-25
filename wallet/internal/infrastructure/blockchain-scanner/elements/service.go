@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/vulpemventures/go-elements/address"
@@ -11,7 +12,6 @@ import (
 	"github.com/vulpemventures/go-elements/network"
 	"github.com/vulpemventures/go-elements/transaction"
 	"github.com/vulpemventures/neutrino-elements/pkg/blockservice"
-	"github.com/vulpemventures/neutrino-elements/pkg/protocol"
 	"github.com/vulpemventures/neutrino-elements/pkg/repository"
 	"github.com/aejkcs50/seqdex/wallet/internal/core/domain"
 	"github.com/aejkcs50/seqdex/wallet/internal/core/ports"
@@ -19,22 +19,29 @@ import (
 )
 
 type service struct {
-	args      ServiceArgs
-	rpcClient *rpcClient
-	blockSvc  blockservice.BlockService
-	scanners  map[string]*scannerService
+	args        ServiceArgs
+	rpcClient   *rpcClient
+	blockSvc    blockservice.BlockService
+	scanners    map[string]*scannerService
+	genesisHash *chainhash.Hash
 
 	filtersRepo repository.FilterRepository
 	headersRepo repository.BlockHeaderRepository
 	lock        *sync.RWMutex
+
+	quit      chan struct{}
+	lastTip   uint32
+	tipTicker *time.Ticker
 }
 
 type ServiceArgs struct {
-	RpcAddr             string
-	Network             string
-	FiltersDatadir      string
-	BlockHeadersDatadir string
-	EsploraUrl          string
+	RpcAddr string
+	Network string
+	// EsploraUrl is optional. When empty the scanner fetches blocks directly
+	// from the node via JSON-RPC (node-RPC-only mode); when set it uses an
+	// external Esplora HTTP endpoint instead. The filters and headers repos are
+	// always node-RPC-backed, so no on-disk datadirs are needed here.
+	EsploraUrl string
 }
 
 func (a ServiceArgs) validate() error {
@@ -44,15 +51,9 @@ func (a ServiceArgs) validate() error {
 	if a.Network == "" {
 		return fmt.Errorf("missing network")
 	}
-	if a.FiltersDatadir == "" {
-		return fmt.Errorf("missing filters datadir")
-	}
-	if a.BlockHeadersDatadir == "" {
-		return fmt.Errorf("missing block headers datadir")
-	}
-	if a.EsploraUrl == "" {
-		return fmt.Errorf("missing esplora url")
-	}
+	// EsploraUrl is optional: when empty the scanner uses the node-RPC block
+	// service instead of Esplora. No datadir requirements: the filters/headers
+	// repos are node-RPC-backed.
 	return nil
 }
 
@@ -75,17 +76,84 @@ func NewElementsScanner(args ServiceArgs) (ports.BlockchainScanner, error) {
 	filtersDb := newFiltersRepo(rpcClient)
 	headersDb := newHeadersRepo(rpcClient)
 
-	blockSvc := blockservice.NewEsploraBlockService(args.EsploraUrl)
+	// Node-RPC-only by default: fetch blocks via JSON-RPC. Fall back to Esplora
+	// only when an EsploraUrl is explicitly configured.
+	var blockSvc blockservice.BlockService
+	if args.EsploraUrl != "" {
+		blockSvc = blockservice.NewEsploraBlockService(args.EsploraUrl)
+	} else {
+		blockSvc = NewRpcBlockService(rpcClient)
+	}
+	// Fetch the real genesis hash from the node rather than relying on the
+	// hardcoded neutrino-elements checkpoints (which only know Liquid networks
+	// and would otherwise yield a wrong genesis for Sequentia).
+	genesisHash, err := fetchGenesisHash(headersDb)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch genesis block hash: %s", err)
+	}
+
 	scanners := make(map[string]*scannerService)
 	lock := &sync.RWMutex{}
 	return &service{
-		args, rpcClient, blockSvc, scanners, filtersDb, headersDb, lock,
+		args:        args,
+		rpcClient:   rpcClient,
+		blockSvc:    blockSvc,
+		scanners:    scanners,
+		genesisHash: genesisHash,
+		filtersRepo: filtersDb,
+		headersRepo: headersDb,
+		lock:        lock,
+		quit:        make(chan struct{}),
 	}, nil
 }
 
-func (s *service) Start() {}
+func (s *service) Start() {
+	// Poll the node for new blocks and re-arm the watches when the chain tip
+	// advances. The vendored neutrino-elements scanner is otherwise driven by a
+	// P2P node pushing new blocks; in node-RPC-only mode nothing pushes blocks,
+	// so without this poll a watch registered before funds arrive would never
+	// rescan the blocks that contain them.
+	s.tipTicker = time.NewTicker(2 * time.Second)
+	go func() {
+		for {
+			select {
+			case <-s.quit:
+				return
+			case <-s.tipTicker.C:
+				s.maybeRescanOnNewTip()
+			}
+		}
+	}()
+}
 
-func (s *service) Stop() {}
+func (s *service) Stop() {
+	if s.tipTicker != nil {
+		s.tipTicker.Stop()
+	}
+	close(s.quit)
+}
+
+// maybeRescanOnNewTip re-arms every active scanner from the previously-seen tip
+// when the chain has grown. Re-watching overlapping ranges is safe: downstream
+// UTXO storage is keyed by txid:vout and ignores duplicates.
+func (s *service) maybeRescanOnNewTip() {
+	tip, err := s.headersRepo.ChainTip(context.Background())
+	if err != nil {
+		return
+	}
+
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	if tip.Height <= s.lastTip {
+		return
+	}
+	from := s.lastTip
+	s.lastTip = tip.Height
+	for _, scannerSvc := range s.scanners {
+		scannerSvc.rescanFrom(from)
+	}
+}
 
 func (s *service) GetUtxoChannel(accountName string) chan []*domain.Utxo {
 	scannerSvc := s.getOrCreateScanner(accountName, 0)
@@ -229,10 +297,9 @@ func (s *service) getOrCreateScanner(
 		return scannerSvc
 	}
 
-	genesisHash := genesisBlockHashForNetwork(s.args.Network)
 	scannerSvc := newScannerSvc(
 		accountName, startingBlock, s.filtersRepo, s.headersRepo, s.blockSvc,
-		genesisHash,
+		s.genesisHash,
 	)
 	s.scanners[accountName] = scannerSvc
 	return scannerSvc
@@ -245,11 +312,11 @@ func (s *service) removeScanner(accountName string) {
 	delete(s.scanners, accountName)
 }
 
-func genesisBlockHashForNetwork(net string) *chainhash.Hash {
-	magic := protocol.Networks[net]
-	genesis := protocol.GetCheckpoints(magic)[0]
-	h, _ := chainhash.NewHashFromStr(genesis)
-	return h
+// fetchGenesisHash returns the height-0 block hash as reported by the node.
+func fetchGenesisHash(
+	headersRepo repository.BlockHeaderRepository,
+) (*chainhash.Hash, error) {
+	return headersRepo.GetBlockHashByHeight(context.Background(), 0)
 }
 
 func addressFromScript(script []byte, net network.Network) string {

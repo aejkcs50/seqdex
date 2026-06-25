@@ -5,11 +5,12 @@ import (
 	"fmt"
 
 	"github.com/btcsuite/btcd/txscript"
-	"github.com/vulpemventures/go-elements/address"
 	"github.com/vulpemventures/go-elements/elementsutil"
 	pb "github.com/aejkcs50/seqdex/wallet/api-spec/protobuf/gen/go/ocean/v1"
+	"github.com/aejkcs50/seqdex/wallet/internal/config"
 	"github.com/aejkcs50/seqdex/wallet/internal/core/application"
 	"github.com/aejkcs50/seqdex/wallet/internal/core/domain"
+	"github.com/aejkcs50/seqdex/wallet/pkg/seqnet"
 	path "github.com/aejkcs50/seqdex/wallet/pkg/wallet/derivation-path"
 )
 
@@ -128,19 +129,20 @@ func parseInputs(ins []*pb.Input) ([]application.Input, error) {
 }
 
 func parseOutputs(outs []*pb.Output) ([]application.Output, error) {
+	net := config.GetNetwork()
 	outputs := make([]application.Output, 0, len(outs))
 	for _, out := range outs {
 		var script, blindKey []byte
 		if addr := out.GetAddress(); addr != "" {
-			isConf, err := address.IsConfidential(addr)
+			isConf, err := seqnet.IsConfidential(addr, net)
 			if err != nil {
 				return nil, err
 			}
 			if isConf {
-				res, _ := address.FromConfidential(addr)
+				res, _ := seqnet.FromConfidential(addr, net)
 				script, blindKey = res.Script, res.BlindingKey
 			} else {
-				script, _ = address.ToOutputScript(addr)
+				script, _ = seqnet.ToOutputScript(addr, net)
 			}
 		} else {
 			script, _ = hex.DecodeString(out.GetScript())

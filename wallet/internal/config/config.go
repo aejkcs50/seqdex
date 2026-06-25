@@ -63,6 +63,10 @@ const (
 	// ElectrumUrlKey is the key for the electrum server endpoint consumed by the
 	// electrum blockchain scanner.
 	ElectrumUrlKey = "ELECTRUM_URL"
+	// EsploraUrlKey is the optional Esplora HTTP endpoint for the elements
+	// blockchain scanner. When empty (the default) the elements scanner fetches
+	// blocks directly from the node via JSON-RPC (node-RPC-only mode).
+	EsploraUrlKey = "ESPLORA_URL"
 	// DbUserKey is user used to connect to db
 	DbUserKey = "DB_USER"
 	// DbPassKey is password used to connect to db
