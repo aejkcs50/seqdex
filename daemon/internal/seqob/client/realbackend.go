@@ -53,6 +53,15 @@ func NewRealBackend(net *network.Network, takerPriv, takerBlinding []byte) *Real
 	return &RealBackend{net: net, taker: trade.NewWalletFromKey(takerPriv, takerBlinding, net)}
 }
 
+// TakerAddress returns the taker wallet's confidential address (the script to
+// fund; its explicit form shares the same scriptPubKey).
+func (b *RealBackend) TakerAddress() string {
+	if b.taker == nil {
+		return ""
+	}
+	return b.taker.Address()
+}
+
 // ProposerBuildRequest selects the taker's UTXOs, builds the proposer PSETv2
 // (confidential or explicit per conf), and wraps it in a SwapRequest.
 func (b *RealBackend) ProposerBuildRequest(req ProposalReq, conf LegConfidentiality) (*seqdexv1.SwapRequest, error) {

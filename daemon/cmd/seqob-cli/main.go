@@ -19,12 +19,15 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/gorilla/websocket"
 	"github.com/thanhpk/randstr"
+	"github.com/vulpemventures/go-elements/network"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 
 	seqobv1 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/seqob/v1"
 	"github.com/aejkcs50/seqdex/daemon/internal/seqob/client"
 	"github.com/aejkcs50/seqdex/daemon/internal/seqob/offer"
+	"github.com/aejkcs50/seqdex/daemon/pkg/explorer/esplora"
+	"github.com/aejkcs50/seqdex/daemon/pkg/seqnet"
 )
 
 var jsonMarshal = protojson.MarshalOptions{UseProtoNames: true}
@@ -142,8 +145,17 @@ func cmdLift(args []string) {
 	offerID := fs.String("offer-id", "", "offer id to lift")
 	makerPub := fs.String("maker-pubkey", "", "maker pubkey of the offer")
 	amount := fs.Uint64("amount", 0, "base atoms to take (<= active)")
-	priv := fs.String("priv", "", "taker session secret key (32-byte hex); generated if empty")
+	priv := fs.String("priv", "", "taker SESSION secret key (32-byte hex, E2E only); generated if empty")
 	feeAsset := fs.String("fee-asset", "", "taker fee asset (any-asset fee market)")
+	// STEP C: live taker seams. When -esplora + -taker-priv + -taker-blinding are
+	// set, the taker builds and broadcasts a REAL on-chain lift via pkg/explorer +
+	// pkg/trade; otherwise it runs the in-memory StubWallet demo.
+	esploraURL := fs.String("esplora", "", "esplora API URL (enables a REAL on-chain lift)")
+	netName := fs.String("net", "testnet", "network: testnet|mainnet")
+	takerPriv := fs.String("taker-priv", "", "taker on-chain signing key (32-byte hex)")
+	takerBlinding := fs.String("taker-blinding", "", "taker on-chain blinding key (32-byte hex)")
+	confidential := fs.Bool("confidential", true, "build a confidential (blinded) taker half; false = explicit")
+	timeout := fs.Duration("timeout", 90*time.Second, "how long to await the maker co-sign")
 	_ = fs.Parse(args)
 
 	if *offerID == "" || *makerPub == "" {
@@ -170,7 +182,11 @@ func cmdLift(args []string) {
 		take = target.GetBaseAmount()
 	}
 
-	takerKey := loadOrGenKey(*priv)
+	// Select the taker wallet: real (LiveWallet + RealBackend over esplora) or the
+	// in-memory StubWallet demo.
+	liftWallet := buildTakerWallet(*esploraURL, *netName, *takerPriv, *takerBlinding, *confidential)
+
+	takerKey := loadOrGenKey(*priv) // ephemeral E2E session key (distinct from the on-chain key)
 
 	// Open the lift session over WS so this connection is bound as the taker, then
 	// courier the encrypted SwapRequest. The relay never sees the plaintext.
@@ -181,14 +197,13 @@ func cmdLift(args []string) {
 	}
 	defer conn.Close()
 
-	startLift := &seqobv1.To{Msg: &seqobv1.To_StartLift{StartLift: &seqobv1.StartLift{
+	writeWS(conn, &seqobv1.To{Msg: &seqobv1.To_StartLift{StartLift: &seqobv1.StartLift{
 		OfferId:            *offerID,
 		MakerPubkey:        *makerPub,
 		TakeAmount:         take,
 		TakerFeeAsset:      *feeAsset,
 		TakerSessionPubkey: takerKey.PubKey().SerializeCompressed(),
-	}}}
-	writeWS(conn, startLift)
+	}}})
 
 	la := readWS(conn)
 	if la.GetLiftAccepted() == nil {
@@ -213,7 +228,7 @@ func cmdLift(args []string) {
 		fatal("crypter: %v", err)
 	}
 
-	taker := &client.Taker{Wallet: &client.StubWallet{Name: "taker"}}
+	taker := &client.Taker{Wallet: liftWallet}
 	sealed, req, err := taker.Propose(target, take, *feeAsset, crypter)
 	if err != nil {
 		fatal("build request: %v", err)
@@ -223,7 +238,79 @@ func cmdLift(args []string) {
 
 	writeWS(conn, &seqobv1.To{Msg: &seqobv1.To_SwapMsg{SwapMsg: &seqobv1.SwapMsg{SessionId: sessionID, Ciphertext: sealed}}})
 	fmt.Printf("couriered encrypted SwapRequest (%d bytes) to session %s\n", len(sealed), sessionID)
-	fmt.Println("awaiting maker co-sign (run a maker process to complete settlement)")
+
+	// Await the maker's sealed SwapAccept, then finalize: sign our inputs, validate,
+	// and broadcast (real backend) or produce a demo txid (stub).
+	fmt.Printf("awaiting maker co-sign (timeout %s)...\n", *timeout)
+	from, err := readWSUntilSwap(conn, *timeout)
+	if err != nil {
+		fatal("no maker co-sign received: %v", err)
+	}
+	sealedComplete, txid, err := taker.Finalize(from.GetSwapMsg().GetCiphertext(), crypter)
+	if err != nil {
+		fatal("finalize/broadcast: %v", err)
+	}
+	// Courier the SwapComplete back so the maker learns the swap settled.
+	writeWS(conn, &seqobv1.To{Msg: &seqobv1.To_SwapMsg{SwapMsg: &seqobv1.SwapMsg{SessionId: sessionID, Ciphertext: sealedComplete}}})
+	fmt.Printf("SWAP SETTLED: txid %s\n", txid)
+}
+
+// buildTakerWallet returns a real LiveWallet (over esplora) when the on-chain
+// flags are provided, else the in-memory StubWallet demo.
+func buildTakerWallet(esploraURL, netName, takerPriv, takerBlinding string, confidential bool) client.Wallet {
+	if esploraURL == "" || takerPriv == "" || takerBlinding == "" {
+		fmt.Println("(demo mode: in-memory StubWallet; pass -esplora -taker-priv -taker-blinding for a REAL lift)")
+		return &client.StubWallet{Name: "taker"}
+	}
+	net := selectNet(netName)
+	svc, err := esplora.NewService(esploraURL, 15)
+	if err != nil {
+		fatal("esplora: %v", err)
+	}
+	rb := client.NewRealBackend(net, mustHex32(takerPriv, "taker-priv"), mustHex32(takerBlinding, "taker-blinding"))
+	rb.FetchUtxos = svc.GetUnspents
+	rb.BroadcastFn = svc.BroadcastTransaction
+	fmt.Printf("LIVE taker (confidential=%v) — fund this address with the pay asset: %s\n", confidential, rb.TakerAddress())
+	return &client.LiveWallet{Backend: rb, TakerInputsConfidential: confidential, TakerRecvConfidential: confidential}
+}
+
+func selectNet(name string) *network.Network {
+	switch strings.ToLower(name) {
+	case "mainnet":
+		return &seqnet.SequentiaMainnet
+	default:
+		return &seqnet.SequentiaTestnet
+	}
+}
+
+func mustHex32(s, label string) []byte {
+	b, err := hex.DecodeString(s)
+	if err != nil || len(b) != 32 {
+		fatal("%s must be 32-byte hex", label)
+	}
+	return b
+}
+
+// readWSUntilSwap reads From frames until a swap_msg arrives or the deadline hits.
+func readWSUntilSwap(c *websocket.Conn, timeout time.Duration) (*seqobv1.From, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		c.SetReadDeadline(deadline)
+		_, data, err := c.ReadMessage()
+		if err != nil {
+			return nil, err
+		}
+		var from seqobv1.From
+		if err := jsonUnmarshal.Unmarshal(data, &from); err != nil {
+			continue
+		}
+		if from.GetSwapMsg() != nil {
+			return &from, nil
+		}
+		if e := from.GetError(); e != nil {
+			return nil, fmt.Errorf("relay error %d: %s", e.GetCode(), e.GetMessage())
+		}
+	}
 }
 
 // --- helpers ---

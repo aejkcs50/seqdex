@@ -63,3 +63,18 @@ func (c *Crypter) Open(sealed []byte) ([]byte, error) {
 	}
 	return c.aead.Open(nil, sealed[:ns], sealed[ns:], nil)
 }
+
+// NewMakerCrypterFromLift derives a maker's per-lift E2E crypter from the maker's
+// offer private key (its key doubles as its session key) and the taker's session
+// pubkey, as delivered in From.lift_requested. The maker then drives the existing
+// Maker.HandleRequest to open the taker's sealed SwapRequest and seal its accept.
+func NewMakerCrypterFromLift(makerOfferPriv *btcec.PrivateKey, takerSessionPubkey []byte) (*Crypter, error) {
+	if makerOfferPriv == nil {
+		return nil, errors.New("nil maker key")
+	}
+	pub, err := btcec.ParsePubKey(takerSessionPubkey)
+	if err != nil {
+		return nil, err
+	}
+	return NewCrypter(makerOfferPriv, pub)
+}

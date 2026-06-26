@@ -116,6 +116,46 @@ func TestCrypterRoundTrip(t *testing.T) {
 	}
 }
 
+// TestMakerCrypterFromLift proves the reusable maker seam: a maker derives the
+// E2E key from its OFFER key + the taker's session pubkey (as delivered in
+// From.lift_requested) and completes the handshake, with no shared secret beyond
+// what the relay couriered.
+func TestMakerCrypterFromLift(t *testing.T) {
+	makerOfferKey, _ := btcec.NewPrivateKey() // the maker's offer (signing) key
+	takerSession, _ := btcec.NewPrivateKey()  // the taker's ephemeral session key
+
+	// Taker seals to the maker's offer pubkey (known from the offer).
+	takerCrypter, err := NewCrypter(takerSession, makerOfferKey.PubKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Maker derives the matching key purely from lift_requested fields.
+	makerCrypter, err := NewMakerCrypterFromLift(makerOfferKey, takerSession.PubKey().SerializeCompressed())
+	if err != nil {
+		t.Fatalf("NewMakerCrypterFromLift: %v", err)
+	}
+
+	taker := &Taker{Wallet: &StubWallet{Name: "taker"}}
+	maker := &Maker{Wallet: &StubWallet{Name: "maker"}}
+	o := sampleOffer()
+
+	sealedReq, _, err := taker.Propose(o, 50, "gold", takerCrypter)
+	if err != nil {
+		t.Fatalf("propose: %v", err)
+	}
+	sealedAcc, err := maker.HandleRequest(sealedReq, makerCrypter)
+	if err != nil {
+		t.Fatalf("maker handle (derived crypter): %v", err)
+	}
+	_, txid, err := taker.Finalize(sealedAcc, takerCrypter)
+	if err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	if txid == "" {
+		t.Fatalf("expected a txid")
+	}
+}
+
 func TestLiveWalletNotWired(t *testing.T) {
 	var w LiveWallet
 	if _, err := w.ProposerBuildRequest(sampleOffer(), 50, "gold"); err == nil {
