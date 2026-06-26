@@ -99,13 +99,23 @@ func (b *RealBackend) ProposerBuildRequest(req ProposalReq, conf LegConfidential
 	if err != nil {
 		return nil, err
 	}
+	// Mirror NewSwapTx's internal coin selection: only the SELECTED utxos become
+	// PSET inputs, so the UnblindedInputs must cover exactly those, in the same
+	// order. Passing every fetched utxo causes "unblinded input index N out of
+	// range" once the taker also holds other utxos (e.g. an asset received from a
+	// prior swap). SelectUnspents is deterministic on the same input slice, so it
+	// reproduces NewSwapTx's selection.
+	selected, _, err := explorer.SelectUnspents(utxos, req.PayAmount, req.PayAsset)
+	if err != nil {
+		return nil, err
+	}
 	reqBytes, err := swap.Request(swap.RequestOpts{
 		AssetToSend:     req.PayAsset,
 		AmountToSend:    req.PayAmount,
 		AssetToReceive:  req.RecvAsset,
 		AmountToReceive: req.RecvAmount,
 		Transaction:     psetB64,
-		UnblindedInputs: utxosToUnblinded(utxos),
+		UnblindedInputs: utxosToUnblinded(selected),
 		FeeAsset:        req.TakerFeeAsset,
 	})
 	if err != nil {
