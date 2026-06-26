@@ -3,13 +3,14 @@
 // and a browser share one encoding.
 //
 // REST:
-//   POST /v1/offers                              submit a signed Offer
-//   POST /v1/offers/cancel                       submit a signed OfferCancel
-//   GET  /v1/offers?maker_pubkey=...             a maker's own orders
-//   GET  /v1/markets                             market summaries
-//   GET  /v1/market/{base}/{quote}/orderbook     per-pair snapshot (PublicBook)
-//   POST /v1/lift                                open a lift session (StartLift)
-//   GET  /v1/ws                                  WebSocket (To/From)
+//
+//	POST /v1/offers                              submit a signed Offer
+//	POST /v1/offers/cancel                       submit a signed OfferCancel
+//	GET  /v1/offers?maker_pubkey=...             a maker's own orders
+//	GET  /v1/markets                             market summaries
+//	GET  /v1/market/{base}/{quote}/orderbook     per-pair snapshot (PublicBook)
+//	POST /v1/lift                                open a lift session (StartLift)
+//	GET  /v1/ws                                  WebSocket (To/From)
 //
 // The relay is NON-CUSTODIAL: it stores signed text, serves the book, and
 // couriers OPAQUE encrypted SwapMsg frames between peers. It never holds keys or
