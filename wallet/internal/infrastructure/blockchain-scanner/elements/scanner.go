@@ -7,6 +7,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aejkcs50/seqdex/wallet/internal/core/domain"
+	"github.com/aejkcs50/seqdex/wallet/internal/infrastructure/blockchain-scanner/scanner"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	log "github.com/sirupsen/logrus"
 	"github.com/vulpemventures/go-elements/confidential"
@@ -14,8 +16,6 @@ import (
 	"github.com/vulpemventures/go-elements/transaction"
 	"github.com/vulpemventures/neutrino-elements/pkg/blockservice"
 	"github.com/vulpemventures/neutrino-elements/pkg/repository"
-	"github.com/vulpemventures/neutrino-elements/pkg/scanner"
-	"github.com/aejkcs50/seqdex/wallet/internal/core/domain"
 )
 
 // unspentWatchItem is a scanner.WatchItem that matches an output by its exact
