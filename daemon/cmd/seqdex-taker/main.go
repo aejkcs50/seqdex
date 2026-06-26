@@ -30,12 +30,18 @@ import (
 	"os"
 	"strconv"
 
+	"github.com/aejkcs50/seqdex/daemon/pkg/explorer"
 	"github.com/aejkcs50/seqdex/daemon/pkg/explorer/elements"
 	"github.com/aejkcs50/seqdex/daemon/pkg/seqnet"
+	"github.com/aejkcs50/seqdex/daemon/pkg/swap"
 	"github.com/aejkcs50/seqdex/daemon/pkg/trade"
 	tradeclient "github.com/aejkcs50/seqdex/daemon/pkg/trade/client"
 	trademarket "github.com/aejkcs50/seqdex/daemon/pkg/trade/market"
 	tradetype "github.com/aejkcs50/seqdex/daemon/pkg/trade/type"
+	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/vulpemventures/go-elements/elementsutil"
+	"github.com/vulpemventures/go-elements/psetv2"
+	"google.golang.org/protobuf/proto"
 )
 
 func main() {
@@ -43,8 +49,14 @@ func main() {
 	keyFile := mustEnv("KEY_FILE")
 	native := mustEnv("NATIVE")
 
-	// Sequentia regtest network with the runtime native asset stamped on.
-	net := seqnet.SequentiaRegtest
+	// Sequentia network (CHAIN env: "sequentia-testnet"/"sequentia-regtest"/
+	// "sequentia"; default testnet) with the runtime native asset stamped on.
+	chain := envDefault("CHAIN", seqnet.Testnet)
+	net, ok := seqnet.ByName(chain)
+	if !ok {
+		fmt.Fprintln(os.Stderr, "unknown CHAIN:", chain)
+		os.Exit(1)
+	}
 	net.AssetID = native
 
 	switch phase {
@@ -84,7 +96,7 @@ func main() {
 		must(err, "trade client")
 
 		t, err := trade.NewTrade(trade.NewTradeOpts{
-			Chain:           seqnet.Regtest,
+			Chain:           chain,
 			NativeAsset:     native,
 			ExplorerService: expl,
 			Client:          client,
@@ -139,10 +151,152 @@ func main() {
 		must(err, "Buy/SellAndComplete")
 		fmt.Println("SWAP_TXID=" + txid)
 		_ = w
+	case "swapself":
+		// Same as "swap" but, instead of relying on the daemon's flaky
+		// CompleteTrade ocean-broadcast, finalize the fully-signed swap PSET
+		// ourselves and emit the raw tx hex so the caller can push it straight
+		// to a producer via POST /api/tx. The daemon still signs its reserve
+		// inputs during TradePropose; we just take over the finalize+broadcast.
+		priv, blind := loadKeys(keyFile)
+		w := trade.NewWalletFromKey(priv, blind, &net)
+
+		nodeRPC := mustEnv("NODE_RPC")
+		tradeAddr := envDefault("TRADE_ADDR", "localhost:9945")
+		base := mustEnv("BASE")
+		quote := mustEnv("QUOTE")
+		typ := envDefault("TYPE", "sell")
+		assetParam := envDefault("ASSET", quote)
+		feeAsset := envDefault("FEE_ASSET", base)
+		amount, err := strconv.ParseUint(mustEnv("AMOUNT"), 10, 64)
+		must(err, "parse AMOUNT")
+
+		expl, err := elements.NewServiceWithNetwork(nodeRPC, nil, &net)
+		must(err, "explorer")
+		host, portStr := splitHostPort(tradeAddr)
+		port, _ := strconv.Atoi(portStr)
+		client, err := tradeclient.NewTradeClient(host, port)
+		must(err, "trade client")
+
+		t, err := trade.NewTrade(trade.NewTradeOpts{
+			Chain:           chain,
+			NativeAsset:     native,
+			ExplorerService: expl,
+			Client:          client,
+		})
+		must(err, "NewTrade")
+		mkt := trademarket.Market{BaseAsset: base, QuoteAsset: quote}
+
+		var tt tradetype.TradeType
+		if typ == "buy" {
+			tt = tradetype.Buy
+		} else {
+			tt = tradetype.Sell
+		}
+
+		preview, err := t.Preview(trade.PreviewOpts{
+			Market: mkt, TradeType: int(tt), Amount: amount,
+			Asset: assetParam, FeeAsset: feeAsset,
+		})
+		must(err, "Preview")
+		fmt.Println("PREVIEW: send", preview.AmountToSend, preview.AssetToSend,
+			"-> receive", preview.AmountToReceive, preview.AssetToReceive)
+
+		utxos, err := expl.GetUnspents(w.Address(), [][]byte{blind})
+		must(err, "GetUnspents")
+		if len(utxos) == 0 {
+			must(fmt.Errorf("taker address not funded"), "utxos")
+		}
+
+		outScript, err := seqnet.ToOutputScript(w.Address(), &net)
+		must(err, "ToOutputScript")
+		_, pk := btcec.PrivKeyFromBytes(blind)
+		outBlindKey := pk.SerializeCompressed()
+
+		amounts := map[string]uint64{
+			preview.AssetToSend:    preview.AmountToSend,
+			preview.AssetToReceive: preview.AmountToReceive,
+		}
+		feesToAdd := tt.IsBuy() && feeAsset == mkt.QuoteAsset ||
+			tt.IsSell() && feeAsset == mkt.BaseAsset
+		if feesToAdd {
+			amounts[preview.FeeAsset] += preview.FeeAmount
+		} else {
+			amounts[preview.FeeAsset] -= preview.FeeAmount
+		}
+
+		// Mirror NewSwapTx's internal coin selection so the UnblindedInputs we
+		// hand to swap.Request match exactly the inputs that end up in the PSET
+		// (NewSwapTx only adds the SELECTED utxos, not every utxo the taker owns).
+		selectedUtxos, _, err := explorer.SelectUnspents(
+			utxos, amounts[preview.AssetToSend], preview.AssetToSend,
+		)
+		must(err, "SelectUnspents")
+
+		psetBase64, err := trade.NewSwapTx(
+			utxos, preview.AssetToSend, preview.AssetToReceive,
+			amounts[preview.AssetToSend], amounts[preview.AssetToReceive],
+			outScript, outBlindKey,
+		)
+		must(err, "NewSwapTx")
+
+		swapReqMsg, err := swap.Request(swap.RequestOpts{
+			AssetToSend:     preview.AssetToSend,
+			AmountToSend:    preview.AmountToSend,
+			AssetToReceive:  preview.AssetToReceive,
+			AmountToReceive: preview.AmountToReceive,
+			Transaction:     psetBase64,
+			UnblindedInputs: takerUnblindedIns(selectedUtxos),
+			FeeAmount:       preview.FeeAmount,
+			FeeAsset:        preview.FeeAsset,
+		})
+		must(err, "swap.Request")
+
+		reply, err := client.TradePropose(tradeclient.TradeProposeOpts{
+			Market: mkt, SwapRequest: swapReqMsg, TradeType: tt,
+			FeeAsset: preview.FeeAsset, FeeAmount: preview.FeeAmount,
+		})
+		must(err, "TradePropose")
+		if fail := reply.GetSwapFail(); fail != nil {
+			must(fmt.Errorf("%s", fail.GetFailureMessage()), "proposal rejected")
+		}
+		swapAcceptMsg, err := proto.Marshal(reply.GetSwapAccept())
+		must(err, "marshal accept")
+
+		// The maker-signed pset is in the SwapAccept; add the taker's signature.
+		signedPset, err := w.Sign(reply.GetSwapAccept().GetTransaction())
+		must(err, "taker Sign")
+		_ = swapAcceptMsg
+
+		// Finalize + extract the fully-signed pset into a network-ready tx.
+		ptx, err := psetv2.NewPsetFromBase64(signedPset)
+		must(err, "parse signed pset")
+		must(psetv2.FinalizeAll(ptx), "finalize")
+		finalTx, err := psetv2.Extract(ptx)
+		must(err, "extract")
+		txHex, err := finalTx.ToHex()
+		must(err, "tx ToHex")
+		txid := finalTx.TxHash().String()
+		fmt.Println("SWAP_TXHEX=" + txHex)
+		fmt.Println("SWAP_TXID=" + txid)
+		_ = w
 	default:
 		fmt.Fprintln(os.Stderr, "unknown PHASE:", phase)
 		os.Exit(2)
 	}
+}
+
+func takerUnblindedIns(utxos []explorer.Utxo) []swap.UnblindedInput {
+	ins := make([]swap.UnblindedInput, 0, len(utxos))
+	for i, u := range utxos {
+		ins = append(ins, swap.UnblindedInput{
+			Index:         uint32(i),
+			Asset:         u.Asset(),
+			Amount:        u.Value(),
+			AssetBlinder:  elementsutil.TxIDFromBytes(u.AssetBlinder()),
+			AmountBlinder: elementsutil.TxIDFromBytes(u.ValueBlinder()),
+		})
+	}
+	return ins
 }
 
 func loadKeys(path string) ([]byte, []byte) {
