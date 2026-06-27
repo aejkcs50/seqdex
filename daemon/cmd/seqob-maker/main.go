@@ -53,6 +53,7 @@ func main() {
 	confidential := flag.Bool("confidential", true, "post a confidential offer (blinded settlement); false = explicit")
 	msats := flag.Uint64("msats-per-byte", 110, "network fee rate (milli-sat/vByte); raise if the node rejects for low fee")
 	offerID := flag.String("offer-id", "", "offer id (random 16-byte hex if empty)")
+	mode := flag.String("mode", "samechain", "settlement mode: samechain | cross (cross = BTC<->asset HTLC over the order book; quote is forced to the BTC sentinel, base is the asset)")
 	flag.Parse()
 
 	if *account == "" {
@@ -91,8 +92,14 @@ func main() {
 		blindingPub = hex.EncodeToString(info.BlindingKey)
 	}
 
-	o := buildOffer(*base, *quote, *side, *baseAmt, *quoteAmt, *feeAsset,
-		*expiry, uint32(*minAnchor), recvAddr, blindingPub, *offerID)
+	var o *seqobv1.Offer
+	if strings.ToLower(*mode) == "cross" {
+		o = buildCrossOffer(*base, *side, *baseAmt, *quoteAmt, *feeAsset,
+			*expiry, uint32(*minAnchor), recvAddr, makerPubHex, *offerID)
+	} else {
+		o = buildOffer(*base, *quote, *side, *baseAmt, *quoteAmt, *feeAsset,
+			*expiry, uint32(*minAnchor), recvAddr, blindingPub, *offerID)
+	}
 	if err := offer.SignOffer(o, makerKey); err != nil {
 		fatal("sign offer: %v", err)
 	}
@@ -127,7 +134,7 @@ func main() {
 	writeWS(conn, &seqobv1.To{Msg: &seqobv1.To_OfferSubmit{OfferSubmit: o}})
 	fmt.Printf("seqob-maker up: posted %s offer %s by maker %s\n", *side, o.GetOfferId(), makerPubHex)
 	fmt.Printf("  pair %s/%s  give %d %s  want %d %s  confidential=%v  fee-rate=%d msat/vB\n",
-		*base, *quote, o.GetOfferAmount(), o.GetOfferAsset(), o.GetWantAmount(), o.GetWantAsset(), *confidential, *msats)
+		o.GetPair().GetBaseAsset(), o.GetPair().GetQuoteAsset(), o.GetOfferAmount(), o.GetOfferAsset(), o.GetWantAmount(), o.GetWantAsset(), *confidential, *msats)
 	fmt.Printf("  taker lifts with: -offer-id %s -maker-pubkey %s\n", o.GetOfferId(), makerPubHex)
 
 	serve(conn, maker, makerKey)
@@ -222,6 +229,50 @@ func buildOffer(base, quote, side string, baseAmt, quoteAmt uint64, feeAsset str
 		o.WantAsset, o.WantAmount = base, baseAmt
 	default:
 		fatal("side must be sell or buy")
+	}
+	return o
+}
+
+// buildCrossOffer builds a CROSS-CHAIN (BTC<->asset) order-book offer: pair is
+// base=asset, quote=the BTC sentinel. The resting CrossChainTerms keys/locktime are
+// ADVISORY (display + a stable signed commitment from the maker identity key); the
+// load-bearing HTLC keys and CLTVs are minted per-lift over the E2E courier (Phase 2).
+// A SELL gives the asset for BTC (taker pays BTC; direction BTC_TO_ASSET); a BUY gives
+// BTC for the asset (taker sells the asset; direction ASSET_TO_BTC).
+func buildCrossOffer(asset, side string, assetAmt, btcAmt uint64, feeAsset string,
+	expiry time.Duration, minAnchor uint32, recvAddr, makerPubHex, id string) *seqobv1.Offer {
+	isSell := strings.ToLower(side) == "sell"
+	direction := offer.DirAssetToBTC
+	if isSell {
+		direction = offer.DirBTCToAsset
+	}
+	o := &seqobv1.Offer{
+		OfferId:        orDefault(id, randstr.Hex(16)),
+		SchemaVersion:  1,
+		Pair:           &seqobv1.AssetPair{BaseAsset: asset, QuoteAsset: offer.BTCSentinel},
+		BaseAmount:     assetAmt,
+		AllowPartial:   false, // cross-chain lifts are whole-HTLC; no partial fills (Phase 1)
+		CreatedAtUnix:  uint64(time.Now().Unix()),
+		ExpiresAtUnix:  uint64(time.Now().Add(expiry).Unix()),
+		FeeAssetHint:   feeAsset,
+		MinAnchorDepth: minAnchor,
+		Settlement: &seqobv1.Offer_CrossChain{CrossChain: &seqobv1.CrossChainTerms{
+			BtcSentinel:      offer.BTCSentinel,
+			MakerRecvAddress: recvAddr,
+			MakerClaimPub:    makerPubHex,
+			MakerRefundPub:   makerPubHex,
+			MakerLegLocktime: 144,
+			Direction:        direction,
+		}},
+	}
+	if isSell {
+		o.TradeDir = seqobv1.TradeDir_TRADE_DIR_SELL
+		o.OfferAsset, o.OfferAmount = asset, assetAmt
+		o.WantAsset, o.WantAmount = offer.BTCSentinel, btcAmt
+	} else {
+		o.TradeDir = seqobv1.TradeDir_TRADE_DIR_BUY
+		o.OfferAsset, o.OfferAmount = offer.BTCSentinel, btcAmt
+		o.WantAsset, o.WantAmount = asset, assetAmt
 	}
 	return o
 }

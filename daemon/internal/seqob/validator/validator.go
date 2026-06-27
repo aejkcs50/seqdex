@@ -14,12 +14,14 @@ package validator
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/btcsuite/btcd/btcec/v2"
 	seqobv1 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/seqob/v1"
 	"github.com/aejkcs50/seqdex/daemon/internal/seqob/offer"
 )
@@ -212,10 +214,63 @@ func (v *Validator) checkTerms(o *seqobv1.Offer) error {
 	}
 	if len(v.cfg.KnownAssets) > 0 {
 		for _, a := range []string{p.GetBaseAsset(), p.GetQuoteAsset(), o.GetOfferAsset(), o.GetWantAsset()} {
+			if offer.IsBTCSentinel(a) {
+				continue // the BTC sentinel is the cross-chain parent-chain placeholder, not a Sequentia asset
+			}
 			if !v.cfg.KnownAssets[strings.ToLower(a)] && !v.cfg.KnownAssets[a] {
 				return fmt.Errorf("unknown asset %q", a)
 			}
 		}
+	}
+	if o.GetCrossChain() != nil {
+		return v.checkCrossChain(o)
+	}
+	return nil
+}
+
+// checkCrossChain validates a cross-chain (BTC<->asset) offer's CrossChainTerms.
+// The resting offer is DISCOVERY-ONLY: maker_claim_pub/maker_refund_pub/
+// maker_leg_locktime are advisory (display + a stable signed commitment); the
+// load-bearing HTLC keys and locktimes are minted per-lift over the E2E courier and
+// bound at settlement by recomputing the redeemScript byte-for-byte. Here we only
+// check the offer is well-formed and self-consistent. Convention: base = the SEQ
+// asset, quote = the BTC sentinel.
+func (v *Validator) checkCrossChain(o *seqobv1.Offer) error {
+	cc := o.GetCrossChain()
+	if cc == nil {
+		return fmt.Errorf("cross-chain offer missing cross_chain terms")
+	}
+	p := o.GetPair()
+	baseBTC, quoteBTC := offer.IsBTCSentinel(p.GetBaseAsset()), offer.IsBTCSentinel(p.GetQuoteAsset())
+	if baseBTC == quoteBTC {
+		return fmt.Errorf("cross-chain pair must have exactly one BTC-sentinel side")
+	}
+	if !quoteBTC {
+		return fmt.Errorf("cross-chain pair must be base=asset, quote=%s", offer.BTCSentinel)
+	}
+	if cc.GetBtcSentinel() != offer.BTCSentinel {
+		return fmt.Errorf("cross_chain btc_sentinel must be %q", offer.BTCSentinel)
+	}
+	for _, pk := range []struct{ name, hexv string }{
+		{"maker_claim_pub", cc.GetMakerClaimPub()},
+		{"maker_refund_pub", cc.GetMakerRefundPub()},
+	} {
+		b, err := hex.DecodeString(pk.hexv)
+		if err != nil {
+			return fmt.Errorf("cross_chain %s not hex: %v", pk.name, err)
+		}
+		if _, err := btcec.ParsePubKey(b); err != nil {
+			return fmt.Errorf("cross_chain %s invalid: %v", pk.name, err)
+		}
+	}
+	if cc.GetMakerLegLocktime() == 0 {
+		return fmt.Errorf("cross_chain maker_leg_locktime must be > 0")
+	}
+	if cc.GetDirection() > 1 {
+		return fmt.Errorf("cross_chain direction must be 0 (BTC->asset) or 1 (asset->BTC)")
+	}
+	if !offer.DirectionConsistent(cc.GetDirection(), o.GetTradeDir() == seqobv1.TradeDir_TRADE_DIR_SELL) {
+		return fmt.Errorf("cross_chain direction inconsistent with trade_dir")
 	}
 	return nil
 }
