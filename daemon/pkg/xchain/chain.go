@@ -27,6 +27,35 @@ func NewChain(rpc *RPC, wallet string) *Chain {
 // RPC exposes the underlying wallet-scoped client (for ad-hoc calls in tests).
 func (c *Chain) RPC() *RPC { return c.rpc }
 
+// FeeExchangeRate returns the node's any-asset fee exchange rate for assetHex (the
+// integer getfeeexchangerates publishes: the asset's value in native-sats x 1e8),
+// and whether a positive rate is published. The rate map may be keyed by human
+// label (asset registry) rather than hex, so resolve labels via dumpassetlabels.
+// Returns (0,false) on any RPC error / missing asset / non-positive rate so callers
+// fall back to the native fee. Used to size an asset-denominated fee so its
+// native-equivalent value stays within the node's relay fee bounds (maxfeerate).
+func (c *Chain) FeeExchangeRate(assetHex string) (uint64, bool) {
+	var rates map[string]int64
+	if err := c.rpc.Call(&rates, "getfeeexchangerates"); err != nil {
+		return 0, false
+	}
+	want := strings.ToLower(assetHex)
+	var labels map[string]string // label -> hex; nil if the node has no registry
+	_ = c.rpc.Call(&labels, "dumpassetlabels")
+	for key, rate := range rates {
+		if rate <= 0 {
+			continue
+		}
+		if strings.ToLower(key) == want {
+			return uint64(rate), true
+		}
+		if hexForLabel, ok := labels[key]; ok && strings.ToLower(hexForLabel) == want {
+			return uint64(rate), true
+		}
+	}
+	return 0, false
+}
+
 // BlockCount returns the current chain height.
 func (c *Chain) BlockCount() (int64, error) {
 	var n int64

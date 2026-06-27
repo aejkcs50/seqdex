@@ -91,7 +91,7 @@ func (s *Service) advance(sw *Swap) {
 		return
 	}
 	if uint32(height) >= sw.q.seqLocktime {
-		refundTxid, err := sw.orch.RefundSEQLeg(sw.seqLeg, sw.q.makerSEQKey, uint32(height), s.safeFee(sw.seqLeg.Funded.Amount))
+		refundTxid, err := sw.orch.RefundSEQLeg(sw.seqLeg, sw.q.makerSEQKey, uint32(height), s.seqLegFee(sw.seqLeg.Funded.AssetID, sw.seqLeg.Funded.Amount))
 		if err != nil {
 			sw.detail = "refund build: " + err.Error()
 			return
@@ -159,7 +159,7 @@ func (s *Service) advanceReverse(sw *Swap) {
 			return
 		}
 		// Claim the taker's SEQ asset leg with the maker's secret, revealing it.
-		txid, cerr := sw.orch.ClaimSEQLeg(sw.seqLeg, sw.q.makerSEQClaimKey, s.safeFee(sw.seqLeg.Funded.Amount))
+		txid, cerr := sw.orch.ClaimSEQLeg(sw.seqLeg, sw.q.makerSEQClaimKey, s.seqLegFee(sw.seqLeg.Funded.AssetID, sw.seqLeg.Funded.Amount))
 		if cerr != nil {
 			sw.detail = "claim seq leg retrying: " + cerr.Error()
 			return
@@ -182,6 +182,30 @@ func (s *Service) safeFee(legAmount uint64) uint64 {
 	fee := s.cfg.SpendFee
 	if max := legAmount / 2; fee > max {
 		fee = max
+	}
+	return fee
+}
+
+// seqLegFee sizes the explicit fee for spending a SEQ-side leg IN THE LEG'S OWN
+// asset. SpendFee is a target fee in native sats; emitting it as a flat atom amount
+// of a VALUABLE asset (e.g. GOLD) gives a huge native-equivalent value that the node
+// rejects on broadcast (rpc -25, maxfeerate). Convert the target into the leg's
+// asset via the open-fee-market exchange rate (asset_atoms = ceil(SpendFee*1e8 /
+// rate)), exactly as the wallet/price-server do, so the fee's native-equivalent
+// value lands inside the node's relay fee bounds. Falls back to the flat SpendFee
+// when no rate is published (e.g. the native asset, where flat atoms are fine).
+// Clamped to half the leg so the output stays positive on small legs.
+func (s *Service) seqLegFee(assetHex string, legAmount uint64) uint64 {
+	fee := s.cfg.SpendFee
+	if rate, ok := s.cfg.SEQ.FeeExchangeRate(assetHex); ok && rate > 0 {
+		const scale = 100_000_000 // 1e8; matches price_server.py / exchangerates.cpp
+		fee = (s.cfg.SpendFee*scale + rate - 1) / rate // ceil
+		if fee == 0 {
+			fee = 1
+		}
+	}
+	if maxFee := legAmount / 2; fee > maxFee {
+		fee = maxFee
 	}
 	return fee
 }
