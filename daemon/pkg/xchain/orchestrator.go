@@ -218,5 +218,14 @@ func (s *Swap) RefundSEQLeg(leg *LegLock, bobRefund *Key, nLockTime uint32, fee 
 	}, nLockTime, bobRefund)
 }
 
+// RefundBTCLeg builds, broadcasts, and returns the txid of the BTC-leg CLTV
+// refund (ELSE branch) at the given nLockTime. It is the reverse-direction
+// (asset->BTC) mirror of RefundSEQLeg: the maker funds the BTC leg, so it must
+// be able to reclaim that BTC after btcLocktime if the taker never funds/claims
+// the SEQ leg. Delegates to the BTC backend (Elements or Bitcoin tx format).
+func (s *Swap) RefundBTCLeg(leg *LegLock, makerRefund *Key, nLockTime uint32, fee uint64) (string, error) {
+	return s.btcBackend.RefundBTCLeg(leg, makerRefund, nLockTime, fee)
+}
+
 // SecretHex returns the swap preimage as hex (Alice side only).
 func (s *Swap) SecretHex() string { return toHex(s.hash.Secret) }

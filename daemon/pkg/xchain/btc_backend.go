@@ -44,6 +44,12 @@ type btcBackend interface {
 	// ClaimBTCLeg spends the HTLC via the redeem/IF branch (revealing the
 	// preimage) to a fresh maker address, broadcasts it, and returns the txid.
 	ClaimBTCLeg(leg *LegLock, claimKey *Key, fee uint64) (string, error)
+
+	// RefundBTCLeg spends the HTLC via the refund/ELSE (CLTV) branch back to a
+	// fresh maker address at the given nLockTime, broadcasts it, and returns the
+	// txid. Used by the REVERSE (asset->BTC) maker — which funds the BTC leg — to
+	// reclaim it after btcLocktime if the taker never funds/claims the SEQ leg.
+	RefundBTCLeg(leg *LegLock, refundKey *Key, nLockTime uint32, fee uint64) (string, error)
 }
 
 // --- Elements BTC backend (original behaviour) ------------------------------
@@ -150,6 +156,32 @@ func (b *elementsBTCBackend) ClaimBTCLeg(leg *LegLock, claimKey *Key, fee uint64
 		DestSPK: dest,
 		Fee:     fee,
 	}, claimKey)
+	if err != nil {
+		return "", err
+	}
+	txid, err := b.chain.Broadcast(rawHex)
+	if err != nil {
+		return "", err
+	}
+	if err := b.chain.Mine(1); err != nil {
+		return "", err
+	}
+	return txid, nil
+}
+
+func (b *elementsBTCBackend) RefundBTCLeg(leg *LegLock, refundKey *Key, nLockTime uint32, fee uint64) (string, error) {
+	dest, err := b.chain.NewDestScript()
+	if err != nil {
+		return "", err
+	}
+	rawHex, err := b.leg.Refund(leg.Script, ElementsSpendInput{
+		TxID:    leg.Funded.TxID,
+		Vout:    leg.Funded.Vout,
+		Amount:  leg.Funded.Amount,
+		AssetID: leg.Funded.AssetID,
+		DestSPK: dest,
+		Fee:     fee,
+	}, nLockTime, refundKey)
 	if err != nil {
 		return "", err
 	}
@@ -281,6 +313,24 @@ func (b *bitcoinBTCBackend) ClaimBTCLeg(leg *LegLock, claimKey *Key, fee uint64)
 		DestPK: dest,
 		Fee:    fee,
 	}, claimKey)
+	if err != nil {
+		return "", err
+	}
+	return b.chain.Broadcast(rawHex)
+}
+
+func (b *bitcoinBTCBackend) RefundBTCLeg(leg *LegLock, refundKey *Key, nLockTime uint32, fee uint64) (string, error) {
+	dest, err := b.chain.NewDestScript()
+	if err != nil {
+		return "", err
+	}
+	rawHex, err := b.leg.BuildRefundTx(leg.Script, BitcoinSpendInput{
+		TxID:   leg.Funded.TxID,
+		Vout:   leg.Funded.Vout,
+		Amount: leg.Funded.Amount,
+		DestPK: dest,
+		Fee:    fee,
+	}, nLockTime, refundKey)
 	if err != nil {
 		return "", err
 	}

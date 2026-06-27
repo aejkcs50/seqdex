@@ -36,7 +36,7 @@ func (s *Service) ListXchainMarkets(
 			Name:           m.Name,
 			SeqReserve:     seqAvail,
 			BtcReserve:     btcReserve,
-			PriceSeqPerBtc: m.PriceSeqPerBtc,
+			PriceSeqPerBtc: s.effectivePrice(m),
 		})
 	}
 	return &seqdexv1.ListXchainMarketsResponse{Markets: out}, nil
@@ -65,11 +65,14 @@ func (s *Service) GetXchainQuote(
 			"requested %d exceeds available SEQ reserve %d", req.GetSeqAmount(), avail)
 	}
 
-	// Pricing: btc = seq / price; fee added on top.
-	if m.PriceSeqPerBtc <= 0 {
+	// Pricing: btc = seq / price; fee added on top. Price is the SEQ node's live
+	// reference rate (ref[BTC]/ref[asset]) when available, else the market's static
+	// configured price.
+	price := s.effectivePrice(m)
+	if price <= 0 {
 		return nil, status.Error(codes.FailedPrecondition, "market price not set")
 	}
-	btcBase := uint64(float64(req.GetSeqAmount()) / m.PriceSeqPerBtc)
+	btcBase := uint64(float64(req.GetSeqAmount()) / price)
 	if btcBase == 0 {
 		btcBase = 1
 	}
@@ -116,7 +119,7 @@ func (s *Service) GetXchainQuote(
 		QuoteId:           q.id,
 		SeqAmount:         q.seqAmount,
 		BtcAmount:         q.btcAmount,
-		PriceSeqPerBtc:    m.PriceSeqPerBtc,
+		PriceSeqPerBtc:    price,
 		FeeBtc:            q.feeBtc,
 		MakerBtcClaimPub:  hex.EncodeToString(makerBTCKey.PubKey()),
 		MakerSeqRefundPub: hex.EncodeToString(makerSEQKey.PubKey()),
@@ -308,6 +311,10 @@ func stateToProto(st State) seqdexv1.XchainSwapState {
 		return seqdexv1.XchainSwapState_XCHAIN_SWAP_STATE_REFUNDED
 	case StateFailed:
 		return seqdexv1.XchainSwapState_XCHAIN_SWAP_STATE_FAILED
+	case StateBTCLocked:
+		return seqdexv1.XchainSwapState_XCHAIN_SWAP_STATE_BTC_LOCKED
+	case StateSeqSubmitted:
+		return seqdexv1.XchainSwapState_XCHAIN_SWAP_STATE_SEQ_SUBMITTED
 	default:
 		return seqdexv1.XchainSwapState_XCHAIN_SWAP_STATE_UNSPECIFIED
 	}

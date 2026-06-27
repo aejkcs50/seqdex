@@ -43,6 +43,11 @@ func (s *Service) advance(sw *Swap) {
 	sw.mu.Lock()
 	defer sw.mu.Unlock()
 
+	if sw.reverse {
+		s.advanceReverse(sw)
+		return
+	}
+
 	if sw.state != StateSeqLocked {
 		return // terminal or in-flight elsewhere
 	}
@@ -99,6 +104,63 @@ func (s *Service) advance(sw *Swap) {
 		sw.state = StateRefunded
 		sw.detail = "taker stalled past T_seq; SEQ leg refunded"
 		s.releaseReserve(sw)
+	}
+}
+
+// advanceReverse drives a REVERSE (asset->BTC) swap. Caller holds sw.mu.
+//
+//   - BTC_LOCKED: the maker funded the BTC leg; it waits for the taker to fund
+//     and submit the SEQ asset leg (SubmitReverseSeqLeg -> SEQ_SUBMITTED). If the
+//     taker never submits and the parent height reaches T_btc, the maker REFUNDS
+//     its own BTC leg.
+//   - SEQ_SUBMITTED: run VerifySeqLegSafe (the anchor-ordering gate) as a HARD
+//     precondition, then CLAIM the SEQ leg with the maker's secret, revealing it
+//     on the Sequentia chain. The taker reads the secret (GetXchainSwap.preimage)
+//     and claims the maker's BTC leg off-daemon, so the maker stops at
+//     SEQ_CLAIMED (it has the asset and revealed s).
+func (s *Service) advanceReverse(sw *Swap) {
+	switch sw.state {
+	case StateBTCLocked:
+		// Refund the maker's BTC leg if the taker never funded the SEQ leg by T_btc.
+		h, err := s.btcHeight()
+		if err != nil {
+			return
+		}
+		if uint32(h) >= sw.q.btcLocktime {
+			txid, rerr := sw.orch.RefundBTCLeg(
+				sw.btcLeg, sw.q.makerBTCRefundKey, sw.q.btcLocktime, s.safeFee(sw.btcLeg.Funded.Amount),
+			)
+			if rerr != nil {
+				sw.detail = "btc refund retrying: " + rerr.Error()
+				return
+			}
+			sw.btcClaimTxid = txid // the maker's BTC-leg spend (here a refund)
+			sw.state = StateRefunded
+			sw.detail = "taker did not submit the SEQ leg before T_btc; BTC leg refunded"
+			s.releaseBtcReserve(sw.q.btcAmount)
+		}
+
+	case StateSeqSubmitted:
+		// HARD anchor-ordering precondition before revealing the secret: the taker's
+		// SEQ leg must anchor at/above the maker's BTC-leg height and the node's
+		// anchor status must be ok. The anchor may not have caught up yet — retry.
+		if _, err := sw.orch.VerifySeqLegSafe(sw.seqBlockHash, sw.btcLegHeight); err != nil {
+			sw.detail = "awaiting anchor gate: " + err.Error()
+			return
+		}
+		// Claim the taker's SEQ asset leg with the maker's secret, revealing it.
+		txid, cerr := sw.orch.ClaimSEQLeg(sw.seqLeg, sw.q.makerSEQClaimKey, s.safeFee(sw.seqLeg.Funded.Amount))
+		if cerr != nil {
+			sw.detail = "claim seq leg retrying: " + cerr.Error()
+			return
+		}
+		sw.seqClaimTxid = txid
+		sw.preimage = sw.q.secret // surfaced via GetXchainSwap so the taker claims BTC
+		sw.state = StateSeqClaimed
+		sw.detail = ""
+		// The maker has the asset and revealed s; its funded BTC will be swept by
+		// the taker. Free the BTC reservation (it has left the maker's pool).
+		s.releaseBtcReserve(sw.q.btcAmount)
 	}
 }
 

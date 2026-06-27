@@ -24,4 +24,15 @@ var (
 	// confirmed to the required depth. The taker must confirm it before the
 	// maker will lock the SEQ leg (the BTC-leg-first ordering rule).
 	ErrBTCLegUnconfirmed = errors.New("xchain: taker BTC leg not confirmed to required depth")
+
+	// ErrSEQLegInvalid is the reverse (asset->BTC) mirror of ErrBTCLegInvalid:
+	// returned when the taker's funded SEQ asset leg does not match the quote
+	// (wrong H, wrong redeemScript, wrong amount/asset, or it does not pay the
+	// expected HTLC P2SH). The maker MUST refuse to reveal the secret (claim the
+	// SEQ leg) in this case.
+	ErrSEQLegInvalid = errors.New("xchain: taker SEQ leg invalid (does not match quote)")
+
+	// ErrSEQLegUnconfirmed is the reverse mirror of ErrBTCLegUnconfirmed: the
+	// taker's SEQ asset leg is not yet confirmed to the required depth.
+	ErrSEQLegUnconfirmed = errors.New("xchain: taker SEQ leg not confirmed to required depth")
 )

@@ -4,16 +4,16 @@
 // - protoc             (unknown)
 // source: seqdex/v1/xchain.proto
 
-// Package seqdex.v1 hosts the SeqDEX cross-chain (BTC<->SEQ-asset) swap API
+// Package seqdex.v1 hosts the SeqDEX cross-chain (BTC<->Sequentia-asset) swap API
 // (Phase 5, milestone 2). It is intentionally a NEW, stateful, multi-step
 // service distinct from the same-chain TradeService (which is a single atomic
 // PSET and does not fit cross-chain). The daemon is the cross-chain
 // MAKER/counterparty: it holds reserves of the parent-chain "BTC" asset and of
-// the anchored SEQ asset, and drives a Design-A single-secret HTLC swap built
+// the anchored Sequentia-chain asset, and drives a Design-A single-secret HTLC swap built
 // on the proven pkg/xchain mechanism.
 //
-// MVP direction (one direction only): the taker BUYS a SEQ asset, paying BTC.
-// This places the taker on the SEQ-receiving side (anchor-shortened ~1-conf
+// MVP direction (one direction only): the taker BUYS a Sequentia-chain asset, paying BTC.
+// This places the taker on the Sequentia-receiving side (anchor-shortened ~1-conf
 // benefit) and makes the taker the INITIATOR who locks the BTC leg first
 // (satisfying the BTC-leg-first ordering rule).
 
@@ -32,31 +32,52 @@ import (
 const _ = grpc.SupportPackageIsVersion7
 
 const (
-	XchainService_ListXchainMarkets_FullMethodName = "/seqdex.v1.XchainService/ListXchainMarkets"
-	XchainService_GetXchainQuote_FullMethodName    = "/seqdex.v1.XchainService/GetXchainQuote"
-	XchainService_ProposeXchainSwap_FullMethodName = "/seqdex.v1.XchainService/ProposeXchainSwap"
-	XchainService_GetXchainSwap_FullMethodName     = "/seqdex.v1.XchainService/GetXchainSwap"
+	XchainService_ListXchainMarkets_FullMethodName     = "/seqdex.v1.XchainService/ListXchainMarkets"
+	XchainService_GetXchainQuote_FullMethodName        = "/seqdex.v1.XchainService/GetXchainQuote"
+	XchainService_ProposeXchainSwap_FullMethodName     = "/seqdex.v1.XchainService/ProposeXchainSwap"
+	XchainService_GetXchainSwap_FullMethodName         = "/seqdex.v1.XchainService/GetXchainSwap"
+	XchainService_GetReverseXchainQuote_FullMethodName = "/seqdex.v1.XchainService/GetReverseXchainQuote"
+	XchainService_OpenReverseXchainSwap_FullMethodName = "/seqdex.v1.XchainService/OpenReverseXchainSwap"
+	XchainService_SubmitReverseSeqLeg_FullMethodName   = "/seqdex.v1.XchainService/SubmitReverseSeqLeg"
 )
 
 // XchainServiceClient is the client API for XchainService service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type XchainServiceClient interface {
-	// ListXchainMarkets returns the BTC/SEQ-asset pairs the maker will swap and
+	// ListXchainMarkets returns the BTC/Sequentia-asset pairs the maker will swap and
 	// its current reserves on each leg.
 	ListXchainMarkets(ctx context.Context, in *ListXchainMarketsRequest, opts ...grpc.CallOption) (*ListXchainMarketsResponse, error)
 	// GetXchainQuote returns a firm-ish quote for buying `seq_amount` units of the
-	// market's SEQ asset with BTC, including the maker's pubkeys and the two
+	// market's Sequentia-chain asset with BTC, including the maker's pubkeys and the two
 	// CLTV timeouts. The quote is held in memory for a short window.
 	GetXchainQuote(ctx context.Context, in *GetXchainQuoteRequest, opts ...grpc.CallOption) (*GetXchainQuoteResponse, error)
 	// ProposeXchainSwap is called by the taker AFTER it has locked + confirmed the
 	// BTC leg. The daemon verifies the BTC leg against the quote (script, H,
-	// amount, recipient, confirmed), then locks the SEQ leg and returns it, or a
+	// amount, recipient, confirmed), then locks the Sequentia leg and returns it, or a
 	// failure.
 	ProposeXchainSwap(ctx context.Context, in *ProposeXchainSwapRequest, opts ...grpc.CallOption) (*ProposeXchainSwapResponse, error)
 	// GetXchainSwap reports the current swap state so the taker can poll for the
-	// maker's BTC-leg claim (and for the preimage the daemon extracted).
+	// maker's BTC-leg claim (and for the preimage the daemon extracted). It serves
+	// BOTH directions; in the reverse direction the `preimage` field is how the
+	// taker reads the secret (revealed by the maker's asset-leg claim) to claim BTC.
 	GetXchainSwap(ctx context.Context, in *GetXchainSwapRequest, opts ...grpc.CallOption) (*GetXchainSwapResponse, error)
+	// GetReverseXchainQuote quotes SELLING `seq_amount` of the market's asset FOR
+	// BTC: returns the BTC the taker will receive (net of fee) and the two CLTV
+	// timeouts. No leg is locked yet; it reserves BTC for the quote window.
+	GetReverseXchainQuote(ctx context.Context, in *GetReverseXchainQuoteRequest, opts ...grpc.CallOption) (*GetReverseXchainQuoteResponse, error)
+	// OpenReverseXchainSwap commits the maker: it generates the secret, LOCKS the
+	// BTC leg (claim=taker, refund=maker, T_btc), and returns the funded BTC leg +
+	// H + the maker's Sequentia-leg claim pubkey, so the taker can fund the asset
+	// leg. The taker supplies its BTC-leg claim pubkey and Sequentia-leg refund
+	// pubkey up front.
+	OpenReverseXchainSwap(ctx context.Context, in *OpenReverseXchainSwapRequest, opts ...grpc.CallOption) (*OpenReverseXchainSwapResponse, error)
+	// SubmitReverseSeqLeg is called by the taker AFTER it funded + confirmed the
+	// Sequentia asset leg. The maker verifies it against the swap (script, H,
+	// amount/asset, confirmations) and admits it; the maker's watcher then runs the
+	// anchor gate and claims the asset leg, revealing the secret (read it via
+	// GetXchainSwap.preimage to claim the BTC leg).
+	SubmitReverseSeqLeg(ctx context.Context, in *SubmitReverseSeqLegRequest, opts ...grpc.CallOption) (*SubmitReverseSeqLegResponse, error)
 }
 
 type xchainServiceClient struct {
@@ -103,25 +124,70 @@ func (c *xchainServiceClient) GetXchainSwap(ctx context.Context, in *GetXchainSw
 	return out, nil
 }
 
+func (c *xchainServiceClient) GetReverseXchainQuote(ctx context.Context, in *GetReverseXchainQuoteRequest, opts ...grpc.CallOption) (*GetReverseXchainQuoteResponse, error) {
+	out := new(GetReverseXchainQuoteResponse)
+	err := c.cc.Invoke(ctx, XchainService_GetReverseXchainQuote_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *xchainServiceClient) OpenReverseXchainSwap(ctx context.Context, in *OpenReverseXchainSwapRequest, opts ...grpc.CallOption) (*OpenReverseXchainSwapResponse, error) {
+	out := new(OpenReverseXchainSwapResponse)
+	err := c.cc.Invoke(ctx, XchainService_OpenReverseXchainSwap_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *xchainServiceClient) SubmitReverseSeqLeg(ctx context.Context, in *SubmitReverseSeqLegRequest, opts ...grpc.CallOption) (*SubmitReverseSeqLegResponse, error) {
+	out := new(SubmitReverseSeqLegResponse)
+	err := c.cc.Invoke(ctx, XchainService_SubmitReverseSeqLeg_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // XchainServiceServer is the server API for XchainService service.
 // All implementations should embed UnimplementedXchainServiceServer
 // for forward compatibility
 type XchainServiceServer interface {
-	// ListXchainMarkets returns the BTC/SEQ-asset pairs the maker will swap and
+	// ListXchainMarkets returns the BTC/Sequentia-asset pairs the maker will swap and
 	// its current reserves on each leg.
 	ListXchainMarkets(context.Context, *ListXchainMarketsRequest) (*ListXchainMarketsResponse, error)
 	// GetXchainQuote returns a firm-ish quote for buying `seq_amount` units of the
-	// market's SEQ asset with BTC, including the maker's pubkeys and the two
+	// market's Sequentia-chain asset with BTC, including the maker's pubkeys and the two
 	// CLTV timeouts. The quote is held in memory for a short window.
 	GetXchainQuote(context.Context, *GetXchainQuoteRequest) (*GetXchainQuoteResponse, error)
 	// ProposeXchainSwap is called by the taker AFTER it has locked + confirmed the
 	// BTC leg. The daemon verifies the BTC leg against the quote (script, H,
-	// amount, recipient, confirmed), then locks the SEQ leg and returns it, or a
+	// amount, recipient, confirmed), then locks the Sequentia leg and returns it, or a
 	// failure.
 	ProposeXchainSwap(context.Context, *ProposeXchainSwapRequest) (*ProposeXchainSwapResponse, error)
 	// GetXchainSwap reports the current swap state so the taker can poll for the
-	// maker's BTC-leg claim (and for the preimage the daemon extracted).
+	// maker's BTC-leg claim (and for the preimage the daemon extracted). It serves
+	// BOTH directions; in the reverse direction the `preimage` field is how the
+	// taker reads the secret (revealed by the maker's asset-leg claim) to claim BTC.
 	GetXchainSwap(context.Context, *GetXchainSwapRequest) (*GetXchainSwapResponse, error)
+	// GetReverseXchainQuote quotes SELLING `seq_amount` of the market's asset FOR
+	// BTC: returns the BTC the taker will receive (net of fee) and the two CLTV
+	// timeouts. No leg is locked yet; it reserves BTC for the quote window.
+	GetReverseXchainQuote(context.Context, *GetReverseXchainQuoteRequest) (*GetReverseXchainQuoteResponse, error)
+	// OpenReverseXchainSwap commits the maker: it generates the secret, LOCKS the
+	// BTC leg (claim=taker, refund=maker, T_btc), and returns the funded BTC leg +
+	// H + the maker's Sequentia-leg claim pubkey, so the taker can fund the asset
+	// leg. The taker supplies its BTC-leg claim pubkey and Sequentia-leg refund
+	// pubkey up front.
+	OpenReverseXchainSwap(context.Context, *OpenReverseXchainSwapRequest) (*OpenReverseXchainSwapResponse, error)
+	// SubmitReverseSeqLeg is called by the taker AFTER it funded + confirmed the
+	// Sequentia asset leg. The maker verifies it against the swap (script, H,
+	// amount/asset, confirmations) and admits it; the maker's watcher then runs the
+	// anchor gate and claims the asset leg, revealing the secret (read it via
+	// GetXchainSwap.preimage to claim the BTC leg).
+	SubmitReverseSeqLeg(context.Context, *SubmitReverseSeqLegRequest) (*SubmitReverseSeqLegResponse, error)
 }
 
 // UnimplementedXchainServiceServer should be embedded to have forward compatible implementations.
@@ -139,6 +205,15 @@ func (UnimplementedXchainServiceServer) ProposeXchainSwap(context.Context, *Prop
 }
 func (UnimplementedXchainServiceServer) GetXchainSwap(context.Context, *GetXchainSwapRequest) (*GetXchainSwapResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetXchainSwap not implemented")
+}
+func (UnimplementedXchainServiceServer) GetReverseXchainQuote(context.Context, *GetReverseXchainQuoteRequest) (*GetReverseXchainQuoteResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetReverseXchainQuote not implemented")
+}
+func (UnimplementedXchainServiceServer) OpenReverseXchainSwap(context.Context, *OpenReverseXchainSwapRequest) (*OpenReverseXchainSwapResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method OpenReverseXchainSwap not implemented")
+}
+func (UnimplementedXchainServiceServer) SubmitReverseSeqLeg(context.Context, *SubmitReverseSeqLegRequest) (*SubmitReverseSeqLegResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method SubmitReverseSeqLeg not implemented")
 }
 
 // UnsafeXchainServiceServer may be embedded to opt out of forward compatibility for this service.
@@ -224,6 +299,60 @@ func _XchainService_GetXchainSwap_Handler(srv interface{}, ctx context.Context, 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _XchainService_GetReverseXchainQuote_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetReverseXchainQuoteRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(XchainServiceServer).GetReverseXchainQuote(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: XchainService_GetReverseXchainQuote_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(XchainServiceServer).GetReverseXchainQuote(ctx, req.(*GetReverseXchainQuoteRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _XchainService_OpenReverseXchainSwap_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(OpenReverseXchainSwapRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(XchainServiceServer).OpenReverseXchainSwap(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: XchainService_OpenReverseXchainSwap_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(XchainServiceServer).OpenReverseXchainSwap(ctx, req.(*OpenReverseXchainSwapRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _XchainService_SubmitReverseSeqLeg_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SubmitReverseSeqLegRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(XchainServiceServer).SubmitReverseSeqLeg(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: XchainService_SubmitReverseSeqLeg_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(XchainServiceServer).SubmitReverseSeqLeg(ctx, req.(*SubmitReverseSeqLegRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // XchainService_ServiceDesc is the grpc.ServiceDesc for XchainService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -246,6 +375,18 @@ var XchainService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetXchainSwap",
 			Handler:    _XchainService_GetXchainSwap_Handler,
+		},
+		{
+			MethodName: "GetReverseXchainQuote",
+			Handler:    _XchainService_GetReverseXchainQuote_Handler,
+		},
+		{
+			MethodName: "OpenReverseXchainSwap",
+			Handler:    _XchainService_OpenReverseXchainSwap_Handler,
+		},
+		{
+			MethodName: "SubmitReverseSeqLeg",
+			Handler:    _XchainService_SubmitReverseSeqLeg_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

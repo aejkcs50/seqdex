@@ -98,18 +98,27 @@ type Config struct {
 	PollInterval time.Duration
 }
 
-// quote is a held quote awaiting a ProposeXchainSwap.
+// quote is a held quote awaiting a ProposeXchainSwap (forward) or an
+// OpenReverseXchainSwap (reverse).
 type quote struct {
 	id          string
 	market      Market
 	seqAmount   uint64
 	btcAmount   uint64
 	feeBtc      uint64
-	makerBTCKey *xchain.Key // maker's BTC-leg claim key
-	makerSEQKey *xchain.Key // maker's SEQ-leg refund key
+	makerBTCKey *xchain.Key // maker's BTC-leg claim key (FORWARD)
+	makerSEQKey *xchain.Key // maker's SEQ-leg refund key (FORWARD)
 	btcLocktime uint32
 	seqLocktime uint32
 	expiresAt   time.Time
+
+	// REVERSE (asset->BTC) fields. Here the maker is the secret holder: it funds
+	// the BTC leg (refund key) and claims the taker's SEQ asset leg (claim key).
+	reverse           bool
+	secret            []byte      // maker-generated preimage
+	hash              []byte      // H = sha256(secret)
+	makerSEQClaimKey  *xchain.Key // maker's SEQ-leg claim key (reveals s)
+	makerBTCRefundKey *xchain.Key // maker's BTC-leg refund key
 }
 
 // State mirrors the proto XchainSwapState.
@@ -122,6 +131,9 @@ const (
 	StateBTCClaimed
 	StateRefunded
 	StateFailed
+	// REVERSE (asset->BTC) states.
+	StateBTCLocked    // maker locked the BTC leg; awaiting the taker's SEQ asset leg
+	StateSeqSubmitted // taker submitted its SEQ leg, verified; awaiting anchor gate + maker claim
 )
 
 // Swap is a live maker-side swap.
@@ -132,13 +144,22 @@ type Swap struct {
 	state State
 	q     *quote
 
+	// reverse selects the asset->BTC direction. It flips the leg roles:
+	//   forward: btcLeg = taker's (maker claims), seqLeg = maker's (taker claims)
+	//   reverse: btcLeg = maker's (taker claims), seqLeg = taker's (maker claims)
+	reverse bool
+
 	orch   *xchain.Swap
-	btcLeg *xchain.LegLock // the taker's verified BTC leg (maker claims this)
-	seqLeg *xchain.LegLock // the maker-locked SEQ leg (taker claims this)
+	btcLeg *xchain.LegLock // forward: taker's leg (maker claims); reverse: maker's leg (taker claims)
+	seqLeg *xchain.LegLock // forward: maker's leg (taker claims); reverse: taker's leg (maker claims)
 
 	seqBlockHash string
 	anchorHeight int64
 	btcLegHeight int64
+
+	// reverse-only: the taker's SEQ-leg refund pubkey (from OpenReverseXchainSwap),
+	// needed to recompute + verify the taker's SEQ-leg redeemScript at submit time.
+	takerSeqRefundPub []byte
 
 	seqClaimTxid string
 	btcClaimTxid string
@@ -157,6 +178,19 @@ type Service struct {
 	// reserved tracks SEQ atoms committed to in-flight swaps so concurrent
 	// quotes do not over-commit the SEQ reserve.
 	reservedSeq map[string]uint64 // seqAsset -> atoms reserved
+
+	// reservedBtc tracks BTC atoms committed to in-flight REVERSE (asset->BTC)
+	// swaps — where the maker funds the BTC leg — so concurrent reverse quotes do
+	// not over-commit the BTC reserve. BTC is a single asset, so this is one total.
+	reservedBtc uint64
+
+	// dynamic pricing: cached USD reference prices from the SEQ node, used to
+	// quote BTC<->asset at live rates (ref[BTC]/ref[asset]) instead of the static
+	// per-market PriceSeqPerBtc. Maps are replaced wholesale, never mutated.
+	priceMu    sync.RWMutex
+	refPrices  map[string]float64 // reference symbol (e.g. "BTC","GOLD") -> USD
+	hex2label  map[string]string  // asset id hex -> dumpassetlabels label
+	refFetched time.Time
 
 	stop chan struct{}
 }
@@ -281,6 +315,42 @@ func (s *Service) availableSeq(seqAsset string) (uint64, error) {
 		return 0, nil
 	}
 	return total - reserved, nil
+}
+
+// availableBtc reports the maker's spendable BTC reserve (atoms) net of BTC
+// committed to in-flight REVERSE swaps. Mirror of availableSeq for the BTC side.
+func (s *Service) availableBtc() (uint64, error) {
+	total, err := s.btcReserveAtoms()
+	if err != nil {
+		return 0, err
+	}
+	s.mu.Lock()
+	reserved := s.reservedBtc
+	s.mu.Unlock()
+	if reserved >= total {
+		return 0, nil
+	}
+	return total - reserved, nil
+}
+
+// reserveBtc commits atoms of the BTC reserve to a reverse swap (caller holds no
+// lock; this takes s.mu).
+func (s *Service) reserveBtc(atoms uint64) {
+	s.mu.Lock()
+	s.reservedBtc += atoms
+	s.mu.Unlock()
+}
+
+// releaseBtcReserve frees previously-reserved BTC (idempotent guard against
+// underflow). Called on terminal reverse-swap states and on open failure.
+func (s *Service) releaseBtcReserve(atoms uint64) {
+	s.mu.Lock()
+	if atoms >= s.reservedBtc {
+		s.reservedBtc = 0
+	} else {
+		s.reservedBtc -= atoms
+	}
+	s.mu.Unlock()
 }
 
 // atomsToCoins formats atoms as a decimal coin string for sendtoaddress.

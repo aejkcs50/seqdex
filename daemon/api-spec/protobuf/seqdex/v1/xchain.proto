@@ -63,10 +63,55 @@ service XchainService {
   }
 
   // GetXchainSwap reports the current swap state so the taker can poll for the
-  // maker's BTC-leg claim (and for the preimage the daemon extracted).
+  // maker's BTC-leg claim (and for the preimage the daemon extracted). It serves
+  // BOTH directions; in the reverse direction the `preimage` field is how the
+  // taker reads the secret (revealed by the maker's asset-leg claim) to claim BTC.
   rpc GetXchainSwap(GetXchainSwapRequest) returns (GetXchainSwapResponse) {
     option (google.api.http) = {
       post: "/v1/xchain/swap"
+      body: "*"
+    };
+  }
+
+  // --- REVERSE direction (asset->BTC): the taker SELLS a Sequentia asset for BTC.
+  // Roles flip vs the forward flow: the MAKER is the secret holder. It funds the
+  // BTC leg FIRST (claim=taker, refund=maker, T_btc, the LONGER timeout), the
+  // taker funds the Sequentia asset leg SECOND (claim=maker, refund=taker, T_seq,
+  // anchored), the maker claims the asset leg (revealing the secret and receiving
+  // the asset), and the taker reads the secret off-chain (GetXchainSwap.preimage)
+  // to claim the maker's BTC leg. The two invariants are UNCHANGED: T_btc > T_seq,
+  // and the Sequentia leg is the second/anchored leg gated by VerifySeqLegSafe.
+
+  // GetReverseXchainQuote quotes SELLING `seq_amount` of the market's asset FOR
+  // BTC: returns the BTC the taker will receive (net of fee) and the two CLTV
+  // timeouts. No leg is locked yet; it reserves BTC for the quote window.
+  rpc GetReverseXchainQuote(GetReverseXchainQuoteRequest) returns (GetReverseXchainQuoteResponse) {
+    option (google.api.http) = {
+      post: "/v1/xchain/reverse/quote"
+      body: "*"
+    };
+  }
+
+  // OpenReverseXchainSwap commits the maker: it generates the secret, LOCKS the
+  // BTC leg (claim=taker, refund=maker, T_btc), and returns the funded BTC leg +
+  // H + the maker's Sequentia-leg claim pubkey, so the taker can fund the asset
+  // leg. The taker supplies its BTC-leg claim pubkey and Sequentia-leg refund
+  // pubkey up front.
+  rpc OpenReverseXchainSwap(OpenReverseXchainSwapRequest) returns (OpenReverseXchainSwapResponse) {
+    option (google.api.http) = {
+      post: "/v1/xchain/reverse/open"
+      body: "*"
+    };
+  }
+
+  // SubmitReverseSeqLeg is called by the taker AFTER it funded + confirmed the
+  // Sequentia asset leg. The maker verifies it against the swap (script, H,
+  // amount/asset, confirmations) and admits it; the maker's watcher then runs the
+  // anchor gate and claims the asset leg, revealing the secret (read it via
+  // GetXchainSwap.preimage to claim the BTC leg).
+  rpc SubmitReverseSeqLeg(SubmitReverseSeqLegRequest) returns (SubmitReverseSeqLegResponse) {
+    option (google.api.http) = {
+      post: "/v1/xchain/reverse/submit"
       body: "*"
     };
   }
@@ -87,10 +132,17 @@ enum XchainSwapState {
   XCHAIN_SWAP_STATE_SEQ_CLAIMED = 3;
   // The daemon claimed the BTC leg with the preimage. Swap complete.
   XCHAIN_SWAP_STATE_BTC_CLAIMED = 4;
-  // The maker refunded its Sequentia leg after T_seq because the taker stalled.
+  // The maker refunded its leg after the timeout because the taker stalled
+  // (forward: its Sequentia leg after T_seq; reverse: its BTC leg after T_btc).
   XCHAIN_SWAP_STATE_REFUNDED = 5;
-  // The swap failed (bad BTC leg, RPC error, etc.). Terminal.
+  // The swap failed (bad leg, RPC error, etc.). Terminal.
   XCHAIN_SWAP_STATE_FAILED = 6;
+  // REVERSE: the maker locked the BTC leg (OpenReverseXchainSwap) and is waiting
+  // for the taker to fund the Sequentia asset leg and call SubmitReverseSeqLeg.
+  XCHAIN_SWAP_STATE_BTC_LOCKED = 7;
+  // REVERSE: the taker submitted its Sequentia asset leg and the maker verified
+  // it; the watcher will run the anchor gate then claim it (revealing the secret).
+  XCHAIN_SWAP_STATE_SEQ_SUBMITTED = 8;
 }
 
 // XchainMarket identifies a swappable BTC/Sequentia-asset pair.
@@ -231,4 +283,83 @@ message GetXchainSwapResponse {
   string preimage = 6;
   // Populated when state == FAILED or REFUNDED.
   string detail = 7;
+}
+
+// ----- REVERSE direction (asset->BTC) messages -----
+
+message GetReverseXchainQuoteRequest {
+  // The Sequentia-chain asset id (hex) identifying the market.
+  string seq_asset = 1;
+  // How many atoms of the Sequentia asset the taker wants to SELL.
+  uint64 seq_amount = 2;
+}
+
+message GetReverseXchainQuoteResponse {
+  // Opaque quote id; pass to OpenReverseXchainSwap.
+  string quote_id = 1;
+  // Sequentia-asset atoms the taker will sell.
+  uint64 seq_amount = 2;
+  // BTC atoms the taker will RECEIVE (net of the maker fee).
+  uint64 btc_amount = 3;
+  // Effective price (Sequentia-asset atoms per BTC atom) used for this quote.
+  double price_seq_per_btc = 4;
+  // Maker fee deducted from btc_amount (BTC atoms), for transparency.
+  uint64 fee_btc = 5;
+  // T_btc: the parent-chain CLTV height at/after which the MAKER may refund its
+  // funded BTC leg. This is the LONGER timeout (T_btc > T_seq).
+  uint32 btc_locktime = 6;
+  // T_seq: the Sequentia CLTV height at/after which the TAKER may refund its
+  // funded asset leg. This is the SHORTER timeout.
+  uint32 seq_locktime = 7;
+  // Unix seconds after which this quote is no longer accepted.
+  int64 expires_at_unix = 8;
+}
+
+message OpenReverseXchainSwapRequest {
+  // The quote being accepted.
+  string quote_id = 1;
+  // The taker's claim pubkey for the BTC leg (33-byte compressed, hex): the maker
+  // locks the BTC leg claimable by THIS key with the preimage.
+  string taker_btc_claim_pub = 2;
+  // The taker's refund pubkey for the Sequentia leg (hex), so the maker can
+  // recompute + verify the asset-leg redeemScript the taker will fund.
+  string taker_seq_refund_pub = 3;
+}
+
+message OpenReverseXchainSwapResponse {
+  oneof result {
+    ReverseXchainSwapOpened opened = 1;
+    XchainSwapFail fail = 2;
+  }
+}
+
+message ReverseXchainSwapOpened {
+  string swap_id = 1;
+  // The maker's funded BTC leg (the taker claims it with the preimage).
+  XchainBtcLeg btc_leg = 2;
+  // H = sha256(secret), hex. The maker generated the secret; only H is published.
+  string hash = 3;
+  // The maker's claim pubkey for the Sequentia leg (hex): the taker funds the
+  // asset leg claimable by THIS key; the maker reveals the secret by claiming it.
+  string maker_seq_claim_pub = 4;
+  // The maker's refund pubkey on the BTC leg (hex), for the taker to recompute +
+  // verify the maker's BTC-leg redeemScript before funding the asset leg.
+  string maker_btc_refund_pub = 5;
+  // T_btc (LONGER) and T_seq (SHORTER) CLTV heights.
+  uint32 btc_locktime = 6;
+  uint32 seq_locktime = 7;
+}
+
+message SubmitReverseSeqLegRequest {
+  string swap_id = 1;
+  // The taker's confirmed Sequentia asset leg: it funded the HTLC claimable by
+  // the maker's seq-claim pubkey and refundable by the taker after T_seq.
+  XchainSeqLeg seq_leg = 2;
+}
+
+message SubmitReverseSeqLegResponse {
+  oneof result {
+    XchainSwapAccepted accepted = 1;
+    XchainSwapFail fail = 2;
+  }
 }

@@ -1,0 +1,717 @@
+{
+  "swagger": "2.0",
+  "info": {
+    "title": "seqdex/v1/xchain.proto",
+    "description": "Package seqdex.v1 hosts the SeqDEX cross-chain (BTC\u003c-\u003eSequentia-asset) swap API\n(Phase 5, milestone 2). It is intentionally a NEW, stateful, multi-step\nservice distinct from the same-chain TradeService (which is a single atomic\nPSET and does not fit cross-chain). The daemon is the cross-chain\nMAKER/counterparty: it holds reserves of the parent-chain \"BTC\" asset and of\nthe anchored Sequentia-chain asset, and drives a Design-A single-secret HTLC swap built\non the proven pkg/xchain mechanism.\n\nMVP direction (one direction only): the taker BUYS a Sequentia-chain asset, paying BTC.\nThis places the taker on the Sequentia-receiving side (anchor-shortened ~1-conf\nbenefit) and makes the taker the INITIATOR who locks the BTC leg first\n(satisfying the BTC-leg-first ordering rule).",
+    "version": "version not set"
+  },
+  "tags": [
+    {
+      "name": "XchainService"
+    }
+  ],
+  "consumes": [
+    "application/json"
+  ],
+  "produces": [
+    "application/json"
+  ],
+  "paths": {
+    "/v1/xchain/markets": {
+      "post": {
+        "summary": "ListXchainMarkets returns the BTC/Sequentia-asset pairs the maker will swap and\nits current reserves on each leg.",
+        "operationId": "XchainService_ListXchainMarkets",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1ListXchainMarketsResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/v1ListXchainMarketsRequest"
+            }
+          }
+        ],
+        "tags": [
+          "XchainService"
+        ]
+      }
+    },
+    "/v1/xchain/propose": {
+      "post": {
+        "summary": "ProposeXchainSwap is called by the taker AFTER it has locked + confirmed the\nBTC leg. The daemon verifies the BTC leg against the quote (script, H,\namount, recipient, confirmed), then locks the Sequentia leg and returns it, or a\nfailure.",
+        "operationId": "XchainService_ProposeXchainSwap",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1ProposeXchainSwapResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/v1ProposeXchainSwapRequest"
+            }
+          }
+        ],
+        "tags": [
+          "XchainService"
+        ]
+      }
+    },
+    "/v1/xchain/quote": {
+      "post": {
+        "summary": "GetXchainQuote returns a firm-ish quote for buying `seq_amount` units of the\nmarket's Sequentia-chain asset with BTC, including the maker's pubkeys and the two\nCLTV timeouts. The quote is held in memory for a short window.",
+        "operationId": "XchainService_GetXchainQuote",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1GetXchainQuoteResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/v1GetXchainQuoteRequest"
+            }
+          }
+        ],
+        "tags": [
+          "XchainService"
+        ]
+      }
+    },
+    "/v1/xchain/reverse/open": {
+      "post": {
+        "summary": "OpenReverseXchainSwap commits the maker: it generates the secret, LOCKS the\nBTC leg (claim=taker, refund=maker, T_btc), and returns the funded BTC leg +\nH + the maker's Sequentia-leg claim pubkey, so the taker can fund the asset\nleg. The taker supplies its BTC-leg claim pubkey and Sequentia-leg refund\npubkey up front.",
+        "operationId": "XchainService_OpenReverseXchainSwap",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1OpenReverseXchainSwapResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/v1OpenReverseXchainSwapRequest"
+            }
+          }
+        ],
+        "tags": [
+          "XchainService"
+        ]
+      }
+    },
+    "/v1/xchain/reverse/quote": {
+      "post": {
+        "summary": "GetReverseXchainQuote quotes SELLING `seq_amount` of the market's asset FOR\nBTC: returns the BTC the taker will receive (net of fee) and the two CLTV\ntimeouts. No leg is locked yet; it reserves BTC for the quote window.",
+        "operationId": "XchainService_GetReverseXchainQuote",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1GetReverseXchainQuoteResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/v1GetReverseXchainQuoteRequest"
+            }
+          }
+        ],
+        "tags": [
+          "XchainService"
+        ]
+      }
+    },
+    "/v1/xchain/reverse/submit": {
+      "post": {
+        "summary": "SubmitReverseSeqLeg is called by the taker AFTER it funded + confirmed the\nSequentia asset leg. The maker verifies it against the swap (script, H,\namount/asset, confirmations) and admits it; the maker's watcher then runs the\nanchor gate and claims the asset leg, revealing the secret (read it via\nGetXchainSwap.preimage to claim the BTC leg).",
+        "operationId": "XchainService_SubmitReverseSeqLeg",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1SubmitReverseSeqLegResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/v1SubmitReverseSeqLegRequest"
+            }
+          }
+        ],
+        "tags": [
+          "XchainService"
+        ]
+      }
+    },
+    "/v1/xchain/swap": {
+      "post": {
+        "summary": "GetXchainSwap reports the current swap state so the taker can poll for the\nmaker's BTC-leg claim (and for the preimage the daemon extracted). It serves\nBOTH directions; in the reverse direction the `preimage` field is how the\ntaker reads the secret (revealed by the maker's asset-leg claim) to claim BTC.",
+        "operationId": "XchainService_GetXchainSwap",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1GetXchainSwapResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/v1GetXchainSwapRequest"
+            }
+          }
+        ],
+        "tags": [
+          "XchainService"
+        ]
+      }
+    }
+  },
+  "definitions": {
+    "protobufAny": {
+      "type": "object",
+      "properties": {
+        "@type": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": {}
+    },
+    "rpcStatus": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "message": {
+          "type": "string"
+        },
+        "details": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/protobufAny"
+          }
+        }
+      }
+    },
+    "v1GetReverseXchainQuoteRequest": {
+      "type": "object",
+      "properties": {
+        "seqAsset": {
+          "type": "string",
+          "description": "The Sequentia-chain asset id (hex) identifying the market."
+        },
+        "seqAmount": {
+          "type": "string",
+          "format": "uint64",
+          "description": "How many atoms of the Sequentia asset the taker wants to SELL."
+        }
+      }
+    },
+    "v1GetReverseXchainQuoteResponse": {
+      "type": "object",
+      "properties": {
+        "quoteId": {
+          "type": "string",
+          "description": "Opaque quote id; pass to OpenReverseXchainSwap."
+        },
+        "seqAmount": {
+          "type": "string",
+          "format": "uint64",
+          "description": "Sequentia-asset atoms the taker will sell."
+        },
+        "btcAmount": {
+          "type": "string",
+          "format": "uint64",
+          "description": "BTC atoms the taker will RECEIVE (net of the maker fee)."
+        },
+        "priceSeqPerBtc": {
+          "type": "number",
+          "format": "double",
+          "description": "Effective price (Sequentia-asset atoms per BTC atom) used for this quote."
+        },
+        "feeBtc": {
+          "type": "string",
+          "format": "uint64",
+          "description": "Maker fee deducted from btc_amount (BTC atoms), for transparency."
+        },
+        "btcLocktime": {
+          "type": "integer",
+          "format": "int64",
+          "description": "T_btc: the parent-chain CLTV height at/after which the MAKER may refund its\nfunded BTC leg. This is the LONGER timeout (T_btc \u003e T_seq)."
+        },
+        "seqLocktime": {
+          "type": "integer",
+          "format": "int64",
+          "description": "T_seq: the Sequentia CLTV height at/after which the TAKER may refund its\nfunded asset leg. This is the SHORTER timeout."
+        },
+        "expiresAtUnix": {
+          "type": "string",
+          "format": "int64",
+          "description": "Unix seconds after which this quote is no longer accepted."
+        }
+      }
+    },
+    "v1GetXchainQuoteRequest": {
+      "type": "object",
+      "properties": {
+        "seqAsset": {
+          "type": "string",
+          "description": "The Sequentia-chain asset id (hex) identifying the market."
+        },
+        "seqAmount": {
+          "type": "string",
+          "format": "uint64",
+          "description": "How many units (atoms) of the Sequentia-chain asset the taker wants to BUY."
+        }
+      }
+    },
+    "v1GetXchainQuoteResponse": {
+      "type": "object",
+      "properties": {
+        "quoteId": {
+          "type": "string",
+          "description": "Opaque quote id; pass to ProposeXchainSwap."
+        },
+        "seqAmount": {
+          "type": "string",
+          "format": "uint64",
+          "description": "Sequentia-asset atoms the taker will receive."
+        },
+        "btcAmount": {
+          "type": "string",
+          "format": "uint64",
+          "description": "BTC atoms the taker must lock on the parent chain."
+        },
+        "priceSeqPerBtc": {
+          "type": "number",
+          "format": "double",
+          "description": "Effective price (Sequentia-asset atoms per BTC atom) used for this quote."
+        },
+        "feeBtc": {
+          "type": "string",
+          "format": "uint64",
+          "description": "Maker fee already folded into btc_amount (BTC atoms), for transparency."
+        },
+        "makerBtcClaimPub": {
+          "type": "string",
+          "description": "The maker's claim pubkey for the BTC leg (33-byte compressed, hex): the\ntaker locks the BTC leg claimable by THIS key with the preimage."
+        },
+        "makerSeqRefundPub": {
+          "type": "string",
+          "description": "The maker's refund pubkey for the Sequentia leg (hex): the maker refunds its own\nSequentia leg with this key after T_seq."
+        },
+        "btcLocktime": {
+          "type": "integer",
+          "format": "int64",
+          "description": "T_btc: the parent-chain CLTV height at/after which the TAKER may refund its\nBTC leg. This is the LONGER timeout (taker refunds last)."
+        },
+        "seqLocktime": {
+          "type": "integer",
+          "format": "int64",
+          "description": "T_seq: the Sequentia CLTV height at/after which the MAKER may refund its Sequentia\nleg. This is the SHORTER timeout (T_btc \u003e T_seq)."
+        },
+        "expiresAtUnix": {
+          "type": "string",
+          "format": "int64",
+          "description": "Unix seconds after which this quote is no longer accepted."
+        }
+      }
+    },
+    "v1GetXchainSwapRequest": {
+      "type": "object",
+      "properties": {
+        "swapId": {
+          "type": "string"
+        }
+      }
+    },
+    "v1GetXchainSwapResponse": {
+      "type": "object",
+      "properties": {
+        "swapId": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/definitions/v1XchainSwapState"
+        },
+        "seqLeg": {
+          "$ref": "#/definitions/v1XchainSeqLeg"
+        },
+        "seqClaimTxid": {
+          "type": "string",
+          "description": "The taker's Sequentia-leg claim txid, once observed (preimage revealed here)."
+        },
+        "btcClaimTxid": {
+          "type": "string",
+          "description": "The maker's BTC-leg claim txid, once the maker has claimed."
+        },
+        "preimage": {
+          "type": "string",
+          "description": "The preimage the maker extracted from the taker's Sequentia claim, hex (empty\nuntil SEQ_CLAIMED). Returned for proof/inspection on regtest."
+        },
+        "detail": {
+          "type": "string",
+          "description": "Populated when state == FAILED or REFUNDED."
+        }
+      }
+    },
+    "v1ListXchainMarketsRequest": {
+      "type": "object"
+    },
+    "v1ListXchainMarketsResponse": {
+      "type": "object",
+      "properties": {
+        "markets": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1XchainMarket"
+          }
+        }
+      }
+    },
+    "v1OpenReverseXchainSwapRequest": {
+      "type": "object",
+      "properties": {
+        "quoteId": {
+          "type": "string",
+          "description": "The quote being accepted."
+        },
+        "takerBtcClaimPub": {
+          "type": "string",
+          "description": "The taker's claim pubkey for the BTC leg (33-byte compressed, hex): the maker\nlocks the BTC leg claimable by THIS key with the preimage."
+        },
+        "takerSeqRefundPub": {
+          "type": "string",
+          "description": "The taker's refund pubkey for the Sequentia leg (hex), so the maker can\nrecompute + verify the asset-leg redeemScript the taker will fund."
+        }
+      }
+    },
+    "v1OpenReverseXchainSwapResponse": {
+      "type": "object",
+      "properties": {
+        "opened": {
+          "$ref": "#/definitions/v1ReverseXchainSwapOpened"
+        },
+        "fail": {
+          "$ref": "#/definitions/v1XchainSwapFail"
+        }
+      }
+    },
+    "v1ProposeXchainSwapRequest": {
+      "type": "object",
+      "properties": {
+        "quoteId": {
+          "type": "string",
+          "description": "The quote being accepted."
+        },
+        "hash": {
+          "type": "string",
+          "description": "H = sha256(secret), hex. Must match the H embedded in the BTC-leg script."
+        },
+        "btcLeg": {
+          "$ref": "#/definitions/v1XchainBtcLeg",
+          "description": "The taker's confirmed BTC leg."
+        },
+        "takerSeqClaimPub": {
+          "type": "string",
+          "description": "The taker's claim pubkey for the Sequentia leg (hex): the daemon locks the Sequentia leg\nclaimable by THIS key with the preimage."
+        },
+        "takerBtcRefundPub": {
+          "type": "string",
+          "description": "The taker's refund pubkey on the BTC leg (hex), for the maker to recompute\nand verify the BTC-leg redeemScript."
+        }
+      }
+    },
+    "v1ProposeXchainSwapResponse": {
+      "type": "object",
+      "properties": {
+        "accepted": {
+          "$ref": "#/definitions/v1XchainSwapAccepted"
+        },
+        "fail": {
+          "$ref": "#/definitions/v1XchainSwapFail"
+        }
+      }
+    },
+    "v1ReverseXchainSwapOpened": {
+      "type": "object",
+      "properties": {
+        "swapId": {
+          "type": "string"
+        },
+        "btcLeg": {
+          "$ref": "#/definitions/v1XchainBtcLeg",
+          "description": "The maker's funded BTC leg (the taker claims it with the preimage)."
+        },
+        "hash": {
+          "type": "string",
+          "description": "H = sha256(secret), hex. The maker generated the secret; only H is published."
+        },
+        "makerSeqClaimPub": {
+          "type": "string",
+          "description": "The maker's claim pubkey for the Sequentia leg (hex): the taker funds the\nasset leg claimable by THIS key; the maker reveals the secret by claiming it."
+        },
+        "makerBtcRefundPub": {
+          "type": "string",
+          "description": "The maker's refund pubkey on the BTC leg (hex), for the taker to recompute +\nverify the maker's BTC-leg redeemScript before funding the asset leg."
+        },
+        "btcLocktime": {
+          "type": "integer",
+          "format": "int64",
+          "description": "T_btc (LONGER) and T_seq (SHORTER) CLTV heights."
+        },
+        "seqLocktime": {
+          "type": "integer",
+          "format": "int64"
+        }
+      }
+    },
+    "v1SubmitReverseSeqLegRequest": {
+      "type": "object",
+      "properties": {
+        "swapId": {
+          "type": "string"
+        },
+        "seqLeg": {
+          "$ref": "#/definitions/v1XchainSeqLeg",
+          "description": "The taker's confirmed Sequentia asset leg: it funded the HTLC claimable by\nthe maker's seq-claim pubkey and refundable by the taker after T_seq."
+        }
+      }
+    },
+    "v1SubmitReverseSeqLegResponse": {
+      "type": "object",
+      "properties": {
+        "accepted": {
+          "$ref": "#/definitions/v1XchainSwapAccepted"
+        },
+        "fail": {
+          "$ref": "#/definitions/v1XchainSwapFail"
+        }
+      }
+    },
+    "v1XchainBtcLeg": {
+      "type": "object",
+      "properties": {
+        "txid": {
+          "type": "string"
+        },
+        "vout": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "height": {
+          "type": "string",
+          "format": "int64",
+          "description": "Parent-chain height at which the BTC leg confirmed (Hp)."
+        },
+        "redeemScript": {
+          "type": "string",
+          "description": "The funded HTLC redeemScript, hex (OP_IF SHA256 H ... claim/refund ...)."
+        },
+        "amount": {
+          "type": "string",
+          "format": "uint64",
+          "description": "Funded value in BTC atoms."
+        },
+        "assetId": {
+          "type": "string",
+          "description": "Parent-chain asset id of the funded output, hex."
+        }
+      },
+      "description": "XchainBtcLeg describes the taker's confirmed BTC-leg HTLC so the daemon can\nverify it. The redeemScript is provided so the daemon can recompute the P2SH\nand confirm the embedded hash/pubkeys/locktime match the quote."
+    },
+    "v1XchainMarket": {
+      "type": "object",
+      "properties": {
+        "btcAsset": {
+          "type": "string",
+          "description": "The parent-chain \"BTC\" (pegged bitcoin) asset id, hex."
+        },
+        "seqAsset": {
+          "type": "string",
+          "description": "The anchored Sequentia asset id, hex."
+        },
+        "name": {
+          "type": "string",
+          "description": "Human label, e.g. \"BTC/USDX\"."
+        },
+        "seqReserve": {
+          "type": "string",
+          "format": "uint64",
+          "description": "The maker's available Sequentia-asset reserve (atoms) to sell."
+        },
+        "btcReserve": {
+          "type": "string",
+          "format": "uint64",
+          "description": "The maker's available BTC reserve (atoms) to receive into."
+        },
+        "priceSeqPerBtc": {
+          "type": "number",
+          "format": "double",
+          "description": "Price: how many Sequentia-asset atoms per 1 BTC atom (the maker's ask)."
+        }
+      },
+      "description": "XchainMarket identifies a swappable BTC/Sequentia-asset pair."
+    },
+    "v1XchainSeqLeg": {
+      "type": "object",
+      "properties": {
+        "txid": {
+          "type": "string"
+        },
+        "vout": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "blockHash": {
+          "type": "string",
+          "description": "The Sequentia block that confirmed the Sequentia leg."
+        },
+        "anchorHeight": {
+          "type": "string",
+          "format": "int64",
+          "description": "The anchorheight committed in that block's header (\u003e= btc_leg.height)."
+        },
+        "redeemScript": {
+          "type": "string",
+          "description": "The Sequentia-leg HTLC redeemScript, hex."
+        },
+        "amount": {
+          "type": "string",
+          "format": "uint64",
+          "description": "Funded Sequentia-asset value in atoms."
+        },
+        "assetId": {
+          "type": "string",
+          "description": "Sequentia-chain asset id, hex."
+        }
+      },
+      "description": "XchainSeqLeg describes the Sequentia-leg HTLC the daemon locked for the taker."
+    },
+    "v1XchainSwapAccepted": {
+      "type": "object",
+      "properties": {
+        "swapId": {
+          "type": "string"
+        },
+        "seqLeg": {
+          "$ref": "#/definitions/v1XchainSeqLeg"
+        }
+      }
+    },
+    "v1XchainSwapFail": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string",
+          "description": "Machine-readable reason (e.g. \"BTC_LEG_UNCONFIRMED\", \"HASH_MISMATCH\")."
+        },
+        "message": {
+          "type": "string"
+        }
+      }
+    },
+    "v1XchainSwapState": {
+      "type": "string",
+      "enum": [
+        "XCHAIN_SWAP_STATE_UNSPECIFIED",
+        "XCHAIN_SWAP_STATE_PENDING_BTC_LOCK",
+        "XCHAIN_SWAP_STATE_SEQ_LOCKED",
+        "XCHAIN_SWAP_STATE_SEQ_CLAIMED",
+        "XCHAIN_SWAP_STATE_BTC_CLAIMED",
+        "XCHAIN_SWAP_STATE_REFUNDED",
+        "XCHAIN_SWAP_STATE_FAILED",
+        "XCHAIN_SWAP_STATE_BTC_LOCKED",
+        "XCHAIN_SWAP_STATE_SEQ_SUBMITTED"
+      ],
+      "default": "XCHAIN_SWAP_STATE_UNSPECIFIED",
+      "description": "XchainSwapState is the maker state machine. Lifecycle (happy path):\n  QUOTED -\u003e PENDING_BTC_LOCK -\u003e SEQ_LOCKED -\u003e SEQ_CLAIMED -\u003e BTC_CLAIMED.\nREFUNDED / FAILED are terminal off-ramps.\n\n - XCHAIN_SWAP_STATE_PENDING_BTC_LOCK: A quote was issued; the daemon is waiting for the taker to lock the BTC leg\nand call ProposeXchainSwap.\n - XCHAIN_SWAP_STATE_SEQ_LOCKED: The daemon verified the BTC leg and locked the Sequentia leg (anchored). Waiting\nfor the taker to claim the Sequentia leg (revealing the preimage).\n - XCHAIN_SWAP_STATE_SEQ_CLAIMED: The taker claimed the Sequentia leg; the daemon has read the preimage off-chain.\n - XCHAIN_SWAP_STATE_BTC_CLAIMED: The daemon claimed the BTC leg with the preimage. Swap complete.\n - XCHAIN_SWAP_STATE_REFUNDED: The maker refunded its leg after the timeout because the taker stalled\n(forward: its Sequentia leg after T_seq; reverse: its BTC leg after T_btc).\n - XCHAIN_SWAP_STATE_FAILED: The swap failed (bad leg, RPC error, etc.). Terminal.\n - XCHAIN_SWAP_STATE_BTC_LOCKED: REVERSE: the maker locked the BTC leg (OpenReverseXchainSwap) and is waiting\nfor the taker to fund the Sequentia asset leg and call SubmitReverseSeqLeg.\n - XCHAIN_SWAP_STATE_SEQ_SUBMITTED: REVERSE: the taker submitted its Sequentia asset leg and the maker verified\nit; the watcher will run the anchor gate then claim it (revealing the secret)."
+    }
+  }
+}
