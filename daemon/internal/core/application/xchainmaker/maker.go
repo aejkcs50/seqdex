@@ -293,6 +293,17 @@ func (s *Service) btcHeight() (int64, error) {
 	return s.cfg.BTC.BlockCount()
 }
 
+// btcConfirmations reports the confirmation depth of a BTC-parent tx (either
+// backend); 0 means seen-but-unconfirmed. Used by the reverse watcher to detect
+// when the maker's own BTC funding leg has confirmed.
+func (s *Service) btcConfirmations(txid string) (int, error) {
+	if s.cfg.ParentKind == ParentBitcoin {
+		_, confs, err := s.cfg.BTCBitcoin.RawTxAndConfirmations(txid)
+		return confs, err
+	}
+	return s.cfg.BTC.TxConfirmations(txid)
+}
+
 // newOrch builds a swap orchestrator bound to the configured parent backend
 // (Elements or real Bitcoin) for the BTC leg and the Sequentia node for the SEQ
 // leg, sharing the given hashlock primitive.

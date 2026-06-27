@@ -3,6 +3,8 @@ package xchain
 import (
 	"bytes"
 	"fmt"
+
+	"github.com/btcsuite/btcd/chaincfg"
 )
 
 // btcBackend abstracts the maker's BTC-leg (parent / anchor-source) operations
@@ -215,9 +217,20 @@ func (b *bitcoinBTCBackend) HTLCScript(claimPub, refundPub []byte, locktime uint
 }
 
 // LockBTCLeg funds the HTLC via bitcoind sendtoaddress to the locally-derived
-// P2SH address. This stands in for the taker's btc.js when the in-process
-// orchestrator drives both roles; in the gRPC maker the taker funds the leg and
-// the maker only VerifyBTCLeg/ClaimBTCLeg.
+// P2SH address and returns the funded leg + the parent height Hp at which it
+// confirmed.
+//
+// On regtest there are no miners, so it mines the funding tx into a block itself
+// (the leg confirms immediately and Hp is the resulting height). On a live
+// network (testnet4/mainnet) there is no on-demand mining: it only broadcasts,
+// the tx sits at 0 confirmations, and Hp is returned as 0 because the funding
+// height is not yet known. The maker's watcher polls for the confirmation and
+// records the real Hp later (advanceReverse), which gates when the taker may fund
+// the anchored SEQ leg.
+//
+// In the REVERSE (asset->BTC) flow the maker funds the BTC leg via this path; in
+// the forward flow the taker funds the BTC leg and the maker only
+// VerifyBTCLeg/ClaimBTCLeg.
 func (b *bitcoinBTCBackend) LockBTCLeg(script []byte, amountCoins string, locktime uint32) (*LegLock, int64, error) {
 	addr, err := b.leg.P2SHAddress(script)
 	if err != nil {
@@ -227,16 +240,23 @@ func (b *bitcoinBTCBackend) LockBTCLeg(script []byte, amountCoins string, lockti
 	if err := b.chain.RPC().Call(&txid, "sendtoaddress", addr, amountCoins); err != nil {
 		return nil, 0, err
 	}
-	// Mine the funding tx into a block.
-	var mineAddr string
-	if err := b.chain.RPC().Call(&mineAddr, "getnewaddress"); err != nil {
-		return nil, 0, err
+
+	// Only regtest can confirm the funding tx on demand; a real network must wait.
+	regtest := b.chain.Params() == &chaincfg.RegressionNetParams
+	if regtest {
+		var mineAddr string
+		if err := b.chain.RPC().Call(&mineAddr, "getnewaddress"); err != nil {
+			return nil, 0, err
+		}
+		var hashes []string
+		if err := b.chain.RPC().Call(&hashes, "generatetoaddress", 1, mineAddr); err != nil {
+			return nil, 0, err
+		}
 	}
-	var hashes []string
-	if err := b.chain.RPC().Call(&hashes, "generatetoaddress", 1, mineAddr); err != nil {
-		return nil, 0, err
-	}
+
 	// Locate the funded vout by matching the P2SH scriptPubKey in the raw tx.
+	// RawTxAndConfirmations resolves the tx at 0 confirmations too (txindex), so
+	// this works whether or not we mined above.
 	rawHex, _, err := b.chain.RawTxAndConfirmations(txid)
 	if err != nil {
 		return nil, 0, err
@@ -245,9 +265,14 @@ func (b *bitcoinBTCBackend) LockBTCLeg(script []byte, amountCoins string, lockti
 	if err != nil {
 		return nil, 0, err
 	}
-	hp, err := b.chain.BlockCount()
-	if err != nil {
-		return nil, 0, err
+
+	// Hp is the confirmation height: known on regtest (we just mined it), unknown
+	// (0) on a live network until the tx confirms and the watcher records it.
+	var hp int64
+	if regtest {
+		if hp, err = b.chain.BlockCount(); err != nil {
+			return nil, 0, err
+		}
 	}
 	return &LegLock{
 		Script:   script,

@@ -283,6 +283,12 @@ message GetXchainSwapResponse {
   string preimage = 6;
   // Populated when state == FAILED or REFUNDED.
   string detail = 7;
+  // The confirmed parent-chain height of the BTC leg (0 until it confirms). In a
+  // REVERSE (asset->BTC) swap the maker funds the BTC leg and broadcasts it at 0
+  // conf on a live network; the taker polls this field and only funds the SEQ leg
+  // once it is > 0, so the SEQ block can anchor at/above this height. In a forward
+  // swap it is the verified height of the taker's BTC leg.
+  int64 btc_leg_height = 8;
 }
 
 // ----- REVERSE direction (asset->BTC) messages -----

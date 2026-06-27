@@ -121,11 +121,21 @@ func (s *Service) advance(sw *Swap) {
 func (s *Service) advanceReverse(sw *Swap) {
 	switch sw.state {
 	case StateBTCLocked:
-		// Refund the maker's BTC leg if the taker never funded the SEQ leg by T_btc.
 		h, err := s.btcHeight()
 		if err != nil {
 			return
 		}
+		// On a live network the maker's BTC leg is broadcast at 0 conf (LockBTCLeg
+		// returns Hp=0). Record its real confirmation height once it lands; the
+		// taker waits for btc_leg_height > 0 (GetXchainSwap) before funding the SEQ
+		// leg, so the SEQ block can anchor at/above Hp. (Regtest already has Hp set.)
+		if sw.btcLegHeight <= 0 {
+			confs, cerr := s.btcConfirmations(sw.btcLeg.Funded.TxID)
+			if cerr == nil && confs >= s.cfg.MinBTCConf {
+				sw.btcLegHeight = h - int64(confs) + 1 // in-memory persist (this MVP has no store)
+			}
+		}
+		// Refund the maker's BTC leg if the taker never funded the SEQ leg by T_btc.
 		if uint32(h) >= sw.q.btcLocktime {
 			txid, rerr := sw.orch.RefundBTCLeg(
 				sw.btcLeg, sw.q.makerBTCRefundKey, sw.q.btcLocktime, s.safeFee(sw.btcLeg.Funded.Amount),

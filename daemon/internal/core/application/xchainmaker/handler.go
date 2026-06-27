@@ -265,6 +265,7 @@ func (s *Service) GetXchainSwap(
 		SeqClaimTxid: sw.seqClaimTxid,
 		BtcClaimTxid: sw.btcClaimTxid,
 		Detail:       sw.detail,
+		BtcLegHeight: sw.btcLegHeight,
 	}
 	if sw.seqLeg != nil {
 		resp.SeqLeg = seqLegToProto(sw.seqLeg, sw.seqBlockHash, sw.anchorHeight, sw.q.market.SeqAsset)

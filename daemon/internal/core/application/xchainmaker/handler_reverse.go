@@ -227,6 +227,15 @@ func (s *Service) SubmitReverseSeqLeg(
 	if sw.state != StateBTCLocked {
 		return submitFail("BAD_STATE", fmt.Sprintf("swap not awaiting a SEQ leg (state %d)", sw.state)), nil
 	}
+	// The maker's BTC leg must have confirmed first: its height Hp is the anchor
+	// floor for the taker's SEQ leg (VerifySeqLegSafe requires the SEQ block to
+	// anchor at/above Hp before the maker reveals s). On a live network LockBTCLeg
+	// returns Hp=0 and the watcher fills it in on confirmation; until then the
+	// taker must wait (poll GetXchainSwap.btc_leg_height) before funding the SEQ leg.
+	if sw.btcLegHeight <= 0 {
+		return submitFail("BTC_LEG_UNCONFIRMED",
+			"maker BTC leg not yet confirmed; wait until GetXchainSwap reports btc_leg_height > 0 before funding the SEQ leg"), nil
+	}
 	sl := req.GetSeqLeg()
 	if sl == nil {
 		return submitFail("MISSING_SEQ_LEG", "seq_leg is required"), nil
