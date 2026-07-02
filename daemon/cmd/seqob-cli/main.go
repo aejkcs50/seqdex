@@ -44,6 +44,10 @@ func main() {
 		cmdBook(os.Args[2:])
 	case "lift":
 		cmdLift(os.Args[2:])
+	case "xlift":
+		cmdXLift(os.Args[2:])
+	case "xrefund":
+		cmdXRefund(os.Args[2:])
 	default:
 		usage()
 	}
@@ -53,9 +57,12 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `seqob-cli <command> [flags]
 
 commands:
-  post   post a signed offer        (flags: -relay -priv -base -quote -dir -base-amount -quote-amount -expiry -fee-asset -recv-addr -id)
-  book   list a market's order book (flags: -relay -base -quote)
-  lift   lift a resting offer       (flags: -relay -base -quote -offer-id -maker-pubkey -amount -priv -fee-asset)`)
+  post    post a signed offer        (flags: -relay -priv -base -quote -dir -base-amount -quote-amount -expiry -fee-asset -recv-addr -id)
+  book    list a market's order book (flags: -relay -base -quote)
+  lift    lift a resting offer       (flags: -relay -base -quote -offer-id -maker-pubkey -amount -priv -fee-asset)
+  xlift   lift a CROSS-CHAIN offer: buy the asset with real BTC over the HTLC courier
+          (flags: -relay -asset -offer-id -maker-pubkey -btc-rpc -btc-wallet -btc-chain -seq-rpc -seq-wallet -state-file)
+  xrefund recover the BTC leg of an aborted xlift after T_btc (flags: -state-file -btc-rpc -btc-wallet -btc-chain -wait)`)
 	os.Exit(2)
 }
 

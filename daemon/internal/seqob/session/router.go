@@ -177,6 +177,19 @@ func (r *Router) StartLift(req OpenReq) (*Session, error) {
 	return s, nil
 }
 
+// ExtendDeadline pushes a session's courier deadline out to now+d. Cross-chain
+// lifts span a real parent-chain confirmation (the taker's BTC leg must confirm
+// before the maker locks the asset leg), so the same-chain co-sign deadline
+// would sweep them mid-handshake; the server extends sessions opened on a
+// CrossChainTerms offer right after StartLift.
+func (r *Router) ExtendDeadline(sessionID string, d time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if s, ok := r.sessions[sessionID]; ok {
+		s.Deadline = r.now().Add(d)
+	}
+}
+
 // Get returns a live session by id.
 func (r *Router) Get(sessionID string) (*Session, bool) {
 	r.mu.Lock()
@@ -192,7 +205,12 @@ func (r *Router) Send(sessionID string, from Role, ciphertext []byte) error {
 	if !ok {
 		return errors.New("unknown session")
 	}
-	if r.now().After(s.Deadline) {
+	// Deadline is read under the router mutex: ExtendDeadline can rewrite it
+	// after the session is published (cross-chain lifts).
+	r.mu.Lock()
+	deadline := s.Deadline
+	r.mu.Unlock()
+	if r.now().After(deadline) {
 		return errors.New("session co-sign deadline elapsed")
 	}
 	var dst chan *seqobv1.SwapMsg

@@ -24,6 +24,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -41,6 +42,10 @@ type Server struct {
 	validator *validator.Validator
 	sessions  *session.Router
 	log       *log.Logger
+	// crossDeadline, when set, replaces the router's default co-sign deadline
+	// for sessions opened on CROSS-CHAIN offers (they span a real parent-chain
+	// confirmation between courier rounds).
+	crossDeadline time.Duration
 	upgrader  websocket.Upgrader
 
 	// makerConns tracks WS connections by registered maker_pubkey so a lift can be
@@ -239,13 +244,27 @@ func (s *Server) openLift(sl *seqobv1.StartLift) (*session.Session, error) {
 	if sl.GetTakeAmount() > e.ActiveAmount {
 		return nil, errString("take_amount exceeds active_amount")
 	}
-	return s.sessions.StartLift(session.OpenReq{
+	sess, err := s.sessions.StartLift(session.OpenReq{
 		OfferID:            sl.GetOfferId(),
 		MakerPubkey:        sl.GetMakerPubkey(),
 		TakeAmount:         sl.GetTakeAmount(),
 		TakerSessionPubkey: sl.GetTakerSessionPubkey(),
 	})
+	if err != nil {
+		return nil, err
+	}
+	// A cross-chain lift spans a real parent-chain confirmation between courier
+	// rounds; give it the longer settlement-type deadline. The relay stays blind
+	// to the couriered bytes — this reads only the offer's settlement TYPE.
+	if s.crossDeadline > 0 && e.Offer.GetCrossChain() != nil {
+		s.sessions.ExtendDeadline(sess.ID, s.crossDeadline)
+	}
+	return sess, nil
 }
+
+// SetCrossSessionDeadline configures the courier deadline for sessions opened on
+// cross-chain offers (0 keeps the router's same-chain default for them too).
+func (s *Server) SetCrossSessionDeadline(d time.Duration) { s.crossDeadline = d }
 
 // --- helpers ---
 

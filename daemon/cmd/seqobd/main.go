@@ -39,6 +39,7 @@ func main() {
 		listen        = flag.String("listen", env("SEQOB_LISTEN", ":9955"), "HTTP listen address (env SEQOB_LISTEN)")
 		nodeRPC       = flag.String("node-rpc", env("SEQOB_NODE_RPC", ""), "read-only Sequentia node RPC URL for future liveness/anchor watch (env SEQOB_NODE_RPC; unused in Phase 1)")
 		sessionTTL    = flag.Duration("session-deadline", 2*time.Minute, "lift session co-sign deadline")
+		xsessionTTL   = flag.Duration("xsession-deadline", 3*time.Hour, "courier deadline for CROSS-CHAIN lift sessions (they span a real parent-chain confirmation; 0 = use -session-deadline)")
 		expirySweep   = flag.Duration("expiry-sweep", 15*time.Second, "offer expiry sweep interval")
 		sessionSweep  = flag.Duration("session-sweep", 10*time.Second, "lift-session deadline sweep interval")
 		minExpiry     = flag.Duration("min-expiry", 30*time.Second, "minimum offer expiry horizon")
@@ -83,6 +84,7 @@ func main() {
 	})
 
 	srv := api.New(store, v, router, logger)
+	srv.SetCrossSessionDeadline(*xsessionTTL)
 
 	stop := make(chan struct{})
 	go store.RunExpirySweeper(*expirySweep, stop)

@@ -135,7 +135,11 @@ func (s *Swap) LockSEQLeg(claimPub, refundPub []byte, amountCoins, assetLabel st
 		time.Sleep(2 * time.Second)
 	}
 	if blockHash == "" {
-		return nil, "", fmt.Errorf("SEQ leg %s funded but not confirmed in time: %w", funded.TxID, err)
+		// The leg IS funded on-chain at this point: return it WITH the error so
+		// the caller can persist the outpoint/script/locktime and refund after
+		// the CLTV instead of orphaning coins behind an unknowable redeem script.
+		return &LegLock{Script: script, Funded: funded, Locktime: locktime}, "",
+			fmt.Errorf("SEQ leg %s funded but not confirmed in time: %w", funded.TxID, err)
 	}
 	return &LegLock{Script: script, Funded: funded, Locktime: locktime}, blockHash, nil
 }
