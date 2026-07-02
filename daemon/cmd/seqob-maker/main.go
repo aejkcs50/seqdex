@@ -369,8 +369,16 @@ func resumeCrossSessions(dir, btcRPCURL, btcWallet, btcChainName, seqRPCURL, seq
 			fmt.Printf("%s: parse: %v\n", name, jerr)
 			continue
 		}
-		if st.Settled || st.SeqRefundTx != "" {
-			fmt.Printf("%s: already terminal (settled=%v refund=%s); skipping\n", name, st.Settled, st.SeqRefundTx)
+		if st.Settled || st.SeqRefundTx != "" || st.BtcRefundTx != "" {
+			fmt.Printf("%s: already terminal (settled=%v seqrefund=%s btcrefund=%s); skipping\n", name, st.Settled, st.SeqRefundTx, st.BtcRefundTx)
+			continue
+		}
+		if st.Direction == "reverse" {
+			// Reverse resume (maker holds the secret; claim the taker's SEQ leg or
+			// refund our BTC leg after T_btc) is not wired yet; surface it so an
+			// operator can act rather than silently leaving funds.
+			fmt.Printf("%s: reverse session — resume not yet implemented; state has the secret + keys for manual recovery (btc_leg %s, T_btc %d)\n",
+				name, st.BtcLegTxid, st.BtcLocktime)
 			continue
 		}
 		if st.SeqLegTxid == "" || st.SeqLegScriptHex == "" || st.BtcClaimPrivHex == "" || st.SeqRefundPrivHex == "" {
@@ -562,8 +570,9 @@ type crossMakerConfig struct {
 // funded from the Sequentia NODE wallet and the claimed BTC lands in the
 // bitcoind wallet — the same reserves the RFQ maker uses (do not re-fund).
 func runCrossMaker(cfg crossMakerConfig) {
-	if strings.ToLower(cfg.side) != "sell" {
-		fatal("-mode cross currently serves -side sell only (taker pays BTC; the reverse direction lands in phase 2e)")
+	sideL := strings.ToLower(cfg.side)
+	if sideL != "sell" && sideL != "buy" {
+		fatal("-mode cross -side must be sell (taker pays BTC) or buy (taker sells the asset)")
 	}
 	if cfg.btcRPCURL == "" || cfg.seqRPCURL == "" {
 		fatal("-mode cross requires -btc-rpc and -xseq-rpc")
@@ -754,32 +763,14 @@ func serveCross(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg crossMakerConfi
 			send := func(sealed []byte) error {
 				return ws.write(&seqobv1.To{Msg: &seqobv1.To_SwapMsg{SwapMsg: &seqobv1.SwapMsg{SessionId: sid, Ciphertext: sealed}}})
 			}
-			p := client.MakerForwardParams{
-				NewOps: func(hashH []byte) (client.XcOps, error) {
-					prim := xchain.NewHashLockFromHash(hashH)
-					swp := xchain.NewSwapBitcoin(btcChain, seqChain, prim)
-					return &client.LiveXcOps{Swap: swp, BTC: btcChain, SEQ: seqChain}, nil
-				},
-				Crypter:          cr,
-				BtcTip:           btcChain.BlockCount,
-				SeqTip:           seqChain.BlockCount,
-				AssetHex:         o.GetPair().GetBaseAsset(),
-				SeqAmount:        o.GetOfferAmount(),
-				BtcAmount:        o.GetWantAmount(),
-				BtcLocktimeDelta: cfg.btcDelta,
-				SeqLocktimeDelta: cfg.seqDelta,
-				MinBTCConf:       cfg.minBTCConf,
-				SpendFeeSats:     cfg.spendFee,
-				Log: func(format string, args ...interface{}) {
-					fmt.Printf("session "+sid+": "+format+"\n", args...)
-				},
-				// Persist every value-bearing transition: the per-lift keys are
-				// the recovery material and exist nowhere else.
-				OnUpdate: func(r *client.MakerForwardResult) {
-					persistXSession(cfg.stateDir, sid, o.GetOfferId(), r)
-				},
+			logf := func(format string, args ...interface{}) { fmt.Printf("session "+sid+": "+format+"\n", args...) }
+			newOpsFromHash := func(hashH []byte) (client.XcOps, error) {
+				swp := xchain.NewSwapBitcoin(btcChain, seqChain, xchain.NewHashLockFromHash(hashH))
+				return &client.LiveXcOps{Swap: swp, BTC: btcChain, SEQ: seqChain}, nil
 			}
-			go func(sid string, in chan []byte) {
+			reverse := o.GetCrossChain().GetDirection() == offer.DirAssetToBTC
+
+			go func(sid string, in chan []byte, reverse bool) {
 				settled := false
 				defer func() {
 					mu.Lock()
@@ -793,6 +784,40 @@ func serveCross(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg crossMakerConfi
 						cancelOffer(cfg.relay, o, cfg.makerKey)
 					}
 				}()
+				if reverse {
+					// BUY: the maker holds the secret and funds the BTC leg first.
+					p := client.MakerReverseParams{
+						NewOps: func(secret []byte) (client.XcOps, error) {
+							swp := xchain.NewSwapBitcoin(btcChain, seqChain, xchain.NewHashLock(secret))
+							return &client.LiveXcOps{Swap: swp, BTC: btcChain, SEQ: seqChain}, nil
+						},
+						Crypter: cr, BtcTip: btcChain.BlockCount, SeqTip: seqChain.BlockCount,
+						AssetHex: o.GetPair().GetBaseAsset(), SeqAmount: o.GetWantAmount(), BtcAmount: o.GetOfferAmount(),
+						BtcLocktimeDelta: cfg.btcDelta, SeqLocktimeDelta: cfg.seqDelta,
+						MinBTCConf: cfg.minBTCConf, SpendFeeSats: cfg.spendFee, Log: logf,
+						OnUpdate: func(r *client.MakerReverseResult) { persistXSessionReverse(cfg.stateDir, sid, o.GetOfferId(), r) },
+					}
+					res, err := client.RunMakerReverse(p, in, send)
+					if err != nil {
+						fmt.Printf("session %s: reverse cross lift ended: %v\n", sid, err)
+						if res != nil && res.BtcRefundTx != "" {
+							fmt.Printf("session %s: BTC leg refunded in %s\n", sid, res.BtcRefundTx)
+						}
+						return
+					}
+					settled = true
+					fmt.Printf("session %s: REVERSE CROSS SWAP SETTLED: claimed the asset in %s\n", sid, res.SeqClaimTxid)
+					return
+				}
+				// SELL (forward): the taker pays BTC and holds the secret.
+				p := client.MakerForwardParams{
+					NewOps: newOpsFromHash, Crypter: cr,
+					BtcTip: btcChain.BlockCount, SeqTip: seqChain.BlockCount,
+					AssetHex: o.GetPair().GetBaseAsset(), SeqAmount: o.GetOfferAmount(), BtcAmount: o.GetWantAmount(),
+					BtcLocktimeDelta: cfg.btcDelta, SeqLocktimeDelta: cfg.seqDelta,
+					MinBTCConf: cfg.minBTCConf, SpendFeeSats: cfg.spendFee, Log: logf,
+					OnUpdate: func(r *client.MakerForwardResult) { persistXSession(cfg.stateDir, sid, o.GetOfferId(), r) },
+				}
 				res, err := client.RunMakerForward(p, in, send)
 				if err != nil {
 					fmt.Printf("session %s: cross lift ended: %v\n", sid, err)
@@ -804,7 +829,7 @@ func serveCross(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg crossMakerConfi
 				settled = true
 				fmt.Printf("session %s: CROSS SWAP SETTLED: taker claimed the asset, BTC claimed in %s\n",
 					sid, res.BtcClaimTxid)
-			}(sid, in)
+			}(sid, in, reverse)
 
 		case from.GetSwapMsg() != nil:
 			sm := from.GetSwapMsg()
@@ -839,9 +864,15 @@ func serveCross(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg crossMakerConfi
 type xmakerSessionState struct {
 	SessionID        string `json:"session_id"`
 	OfferID          string `json:"offer_id"`
+	Direction        string `json:"direction,omitempty"` // "forward" (sell) | "reverse" (buy)
 	HashHex          string `json:"hash_hex,omitempty"`
-	BtcClaimPrivHex  string `json:"btc_claim_priv_hex,omitempty"`
-	SeqRefundPrivHex string `json:"seq_refund_priv_hex,omitempty"`
+	BtcClaimPrivHex  string `json:"btc_claim_priv_hex,omitempty"`  // forward: claims taker BTC
+	SeqRefundPrivHex string `json:"seq_refund_priv_hex,omitempty"` // forward: refunds our SEQ leg
+	// reverse: the maker holds the secret, claims the taker's SEQ leg, refunds its own BTC leg
+	SecretForRefundHex string `json:"secret_for_refund_hex,omitempty"` // reverse: same as secret_hex, named for clarity
+	SeqClaimPrivHex    string `json:"seq_claim_priv_hex,omitempty"`    // reverse: claims taker SEQ
+	BtcRefundPrivHex   string `json:"btc_refund_priv_hex,omitempty"`   // reverse: refunds our BTC leg
+	BtcRefundTx        string `json:"btc_refund_tx,omitempty"`         // reverse
 	BtcLocktime      uint32 `json:"btc_locktime,omitempty"`
 	SeqLocktime      uint32 `json:"seq_locktime,omitempty"`
 	BtcLegTxid       string `json:"btc_leg_txid,omitempty"`
@@ -855,15 +886,16 @@ type xmakerSessionState struct {
 	SeqLegScriptHex  string `json:"seq_leg_script_hex,omitempty"`
 	SeqBlockHash     string `json:"seq_block_hash,omitempty"`
 	SecretHex        string `json:"secret_hex,omitempty"`
-	BtcClaimTxid     string `json:"btc_claim_txid,omitempty"`
-	SeqRefundTx      string `json:"seq_refund_tx,omitempty"`
+	BtcClaimTxid     string `json:"btc_claim_txid,omitempty"`  // forward: maker claimed the taker's BTC
+	SeqRefundTx      string `json:"seq_refund_tx,omitempty"`   // forward: maker refunded its SEQ leg
+	SeqClaimTxid     string `json:"seq_claim_txid,omitempty"`  // reverse: maker claimed the taker's SEQ
 	Settled          bool   `json:"settled"`
 	UpdatedAt        string `json:"updated_at"`
 }
 
 func persistXSession(dir, sid, offerID string, r *client.MakerForwardResult) {
 	st := xmakerSessionState{
-		SessionID: sid, OfferID: offerID,
+		SessionID: sid, OfferID: offerID, Direction: "forward",
 		BtcLocktime: r.BtcLocktime, SeqLocktime: r.SeqLocktime,
 		SeqBlockHash: r.SeqBlockHash,
 		BtcClaimTxid: r.BtcClaimTxid, SeqRefundTx: r.SeqRefundTx,
@@ -890,6 +922,50 @@ func persistXSession(dir, sid, offerID string, r *client.MakerForwardResult) {
 	}
 	if len(r.Secret) > 0 {
 		st.SecretHex = hex.EncodeToString(r.Secret)
+	}
+	b, err := json.MarshalIndent(&st, "", "  ")
+	if err != nil {
+		fmt.Printf("session %s: persist marshal: %v\n", sid, err)
+		return
+	}
+	if err := ioutil.WriteFile(filepath.Join(dir, sid+".json"), b, 0o600); err != nil {
+		fmt.Printf("session %s: persist write: %v\n", sid, err)
+	}
+}
+
+// persistXSessionReverse snapshots a reverse (buy) cross lift. The maker holds
+// the secret and funds the BTC leg, so the recovery material is the secret plus
+// the seq-claim / btc-refund keys and both legs.
+func persistXSessionReverse(dir, sid, offerID string, r *client.MakerReverseResult) {
+	st := xmakerSessionState{
+		SessionID: sid, OfferID: offerID, Direction: "reverse",
+		BtcLocktime: r.BtcLocktime, SeqLocktime: r.SeqLocktime,
+		SeqBlockHash: r.SeqBlockHash,
+		SeqClaimTxid: r.SeqClaimTxid, BtcRefundTx: r.BtcRefundTx,
+		Settled:   r.Settled,
+		UpdatedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+	if len(r.HashH) > 0 {
+		st.HashHex = hex.EncodeToString(r.HashH)
+	}
+	if len(r.Secret) > 0 {
+		st.SecretHex = hex.EncodeToString(r.Secret)
+		st.SecretForRefundHex = st.SecretHex
+	}
+	if r.SeqClaimKey != nil {
+		st.SeqClaimPrivHex = hex.EncodeToString(r.SeqClaimKey.Bytes())
+	}
+	if r.BtcRefundKey != nil {
+		st.BtcRefundPrivHex = hex.EncodeToString(r.BtcRefundKey.Bytes())
+	}
+	if r.BtcLeg != nil && r.BtcLeg.Funded != nil {
+		st.BtcLegTxid, st.BtcLegVout, st.BtcLegAmount = r.BtcLeg.Funded.TxID, r.BtcLeg.Funded.Vout, r.BtcLeg.Funded.Amount
+		st.BtcLegScriptHex = hex.EncodeToString(r.BtcLeg.Script)
+	}
+	if r.SeqLeg != nil && r.SeqLeg.Funded != nil {
+		st.SeqLegTxid, st.SeqLegVout, st.SeqLegAmount = r.SeqLeg.Funded.TxID, r.SeqLeg.Funded.Vout, r.SeqLeg.Funded.Amount
+		st.SeqLegAsset = r.SeqLeg.Funded.AssetID
+		st.SeqLegScriptHex = hex.EncodeToString(r.SeqLeg.Script)
 	}
 	b, err := json.MarshalIndent(&st, "", "  ")
 	if err != nil {

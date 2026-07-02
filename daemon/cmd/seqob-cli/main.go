@@ -48,6 +48,10 @@ func main() {
 		cmdXLift(os.Args[2:])
 	case "xrefund":
 		cmdXRefund(os.Args[2:])
+	case "xsell":
+		cmdXSell(os.Args[2:])
+	case "xrefund-seq":
+		cmdXRefundSeq(os.Args[2:])
 	default:
 		usage()
 	}
@@ -62,7 +66,10 @@ commands:
   lift    lift a resting offer       (flags: -relay -base -quote -offer-id -maker-pubkey -amount -priv -fee-asset)
   xlift   lift a CROSS-CHAIN offer: buy the asset with real BTC over the HTLC courier
           (flags: -relay -asset -offer-id -maker-pubkey -btc-rpc -btc-wallet -btc-chain -seq-rpc -seq-wallet -state-file)
-  xrefund recover the BTC leg of an aborted xlift after T_btc (flags: -state-file -btc-rpc -btc-wallet -btc-chain -wait)`)
+  xrefund recover the BTC leg of an aborted xlift after T_btc (flags: -state-file -btc-rpc -btc-wallet -btc-chain -wait)
+  xsell   sell the asset for real BTC over a REVERSE cross offer (maker holds the secret, funds BTC first)
+          (flags: -relay -asset -offer-id -maker-pubkey -btc-rpc -btc-wallet -btc-chain -seq-rpc -seq-wallet -state-file)
+  xrefund-seq  recover the asset leg of an aborted xsell after T_seq (flags: -state-file -seq-rpc -seq-wallet -wait)`)
 	os.Exit(2)
 }
 

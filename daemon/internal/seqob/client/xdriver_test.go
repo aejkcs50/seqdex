@@ -539,7 +539,9 @@ func reverseFixture(t *testing.T) (st *fakeChainState, net *fakeXcNet, tp TakerR
 		BtcAmount: 25_000,
 		Timing:    tp.Timing,
 	}
-	tp.Ops = &lazyHashOps{st: st}
+	tp.NewOps = func(hashH []byte) (XcOps, error) {
+		return &fakeOps{st: st, hashH: hashH}, nil
+	}
 	return st, net, tp, mp
 }
 
@@ -554,72 +556,6 @@ func makerReverseOps(st *fakeChainState) func([]byte) (XcOps, error) {
 		return (&fakeOps{st: st, hashH: h[:]}).withSecret(secret), nil
 	}
 }
-
-// lazyHashOps is a taker-side fakeOps whose hash is resolved from the maker's
-// minted secret (via the shared chain state) the first time it is needed.
-type lazyHashOps struct {
-	fakeOps
-	st *fakeChainState
-}
-
-func (l *lazyHashOps) ensure() {
-	if l.fakeOps.st == nil {
-		l.fakeOps.st = l.st
-	}
-	if l.fakeOps.hashH == nil {
-		l.st.mu.Lock()
-		s := l.st.makerSecret
-		l.st.mu.Unlock()
-		if len(s) > 0 {
-			h := sha256.Sum256(s)
-			l.fakeOps.hashH = h[:]
-		}
-	}
-}
-func (l *lazyHashOps) BtcTip() (int64, error)                    { l.ensure(); return l.fakeOps.BtcTip() }
-func (l *lazyHashOps) BtcConfirmations(t string) (int, error)   { l.ensure(); return l.fakeOps.BtcConfirmations(t) }
-func (l *lazyHashOps) LockBTCLeg(a, b []byte, c string, d uint32) (*xchain.LegLock, int64, error) {
-	l.ensure()
-	return l.fakeOps.LockBTCLeg(a, b, c, d)
-}
-func (l *lazyHashOps) VerifyBTCLeg(h, mc, tr, ps []byte, bl uint32, tx string, v uint32, am uint64, mn int) (*xchain.VerifiedBTCLeg, error) {
-	l.ensure()
-	return l.fakeOps.VerifyBTCLeg(h, mc, tr, ps, bl, tx, v, am, mn)
-}
-func (l *lazyHashOps) ClaimBTCLeg(lg *xchain.LegLock, k *xchain.Key, f uint64) (string, error) {
-	l.ensure()
-	return "btc-claim", nil
-}
-func (l *lazyHashOps) RefundBTCLeg(lg *xchain.LegLock, k *xchain.Key, nl uint32, f uint64) (string, error) {
-	return "btc-refund", nil
-}
-func (l *lazyHashOps) SeqTip() (int64, error)                    { l.ensure(); return l.fakeOps.SeqTip() }
-func (l *lazyHashOps) SeqAnchorHeightOf(b string) (int64, error) { l.ensure(); return l.fakeOps.SeqAnchorHeightOf(b) }
-func (l *lazyHashOps) SeqBlockHashOfTx(t string) (string, error) { return "seq-block-hash", nil }
-func (l *lazyHashOps) SeqFeeRate(a string) (uint64, bool)        { return 50_000_000_000, true }
-func (l *lazyHashOps) LockSEQLeg(a, b []byte, c, d string, e uint32) (*xchain.LegLock, string, error) {
-	l.ensure()
-	return l.fakeOps.LockSEQLeg(a, b, c, d, e)
-}
-func (l *lazyHashOps) VerifySEQLeg(h, c, r, ps []byte, sl uint32, tx string, v uint32, am uint64, as string, mn int) (*xchain.VerifiedSEQLeg, error) {
-	l.ensure()
-	return l.fakeOps.VerifySEQLeg(h, c, r, ps, sl, tx, v, am, as, mn)
-}
-func (l *lazyHashOps) VerifySeqLegSafe(b string, h int64) (*xchain.AnchorEvidence, error) {
-	return &xchain.AnchorEvidence{OK: true, SeqBlockHash: b, BTCLegHeight: h}, nil
-}
-func (l *lazyHashOps) ClaimSEQLeg(lg *xchain.LegLock, k *xchain.Key, f uint64) (string, error) {
-	l.ensure()
-	return l.fakeOps.ClaimSEQLeg(lg, k, f)
-}
-func (l *lazyHashOps) WatchSEQClaim(lg *xchain.LegLock) (string, []byte, error) {
-	return l.fakeOps.WatchSEQClaim(lg)
-}
-func (l *lazyHashOps) InjectSecret(s []byte) error { l.ensure(); return l.fakeOps.InjectSecret(s) }
-func (l *lazyHashOps) RefundSEQLeg(lg *xchain.LegLock, k *xchain.Key, nl uint32, f uint64) (string, error) {
-	return "seq-refund-raw", nil
-}
-func (l *lazyHashOps) SeqBroadcast(r string) (string, error) { return l.fakeOps.SeqBroadcast(r) }
 
 func TestReverseHappyPath(t *testing.T) {
 	_, net, tp, mp := reverseFixture(t)

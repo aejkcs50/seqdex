@@ -32,7 +32,11 @@ import (
 // TakerReverseParams configures RunTakerReverse. Expectations come from the
 // SIGNED offer (a maker BUY: it gives BTC, wants the asset).
 type TakerReverseParams struct {
-	Ops     XcOps
+	// NewOps binds the settlement engine to the hashlock H once the maker's
+	// terms arrive. The taker does not know the secret, but its SEQ leg script
+	// and its BTC claim both embed H, so the swap must be built from the H in
+	// the terms (mirrors the forward maker's NewOps(hashH)).
+	NewOps  func(hashH []byte) (XcOps, error)
 	Crypter *Crypter
 
 	BtcClaimKey  *xchain.Key // claims the maker's BTC leg once the secret is revealed
@@ -89,7 +93,7 @@ func (p *TakerReverseParams) logf(format string, args ...interface{}) {
 // or refund the SEQ leg once T_seq passes without a claim.
 func RunTakerReverse(p TakerReverseParams, send XcSend, recv XcRecv) (*TakerReverseResult, error) {
 	p.Timing.setDefaults()
-	if p.Ops == nil || p.Crypter == nil || p.BtcClaimKey == nil || p.SeqRefundKey == nil {
+	if p.NewOps == nil || p.Crypter == nil || p.BtcClaimKey == nil || p.SeqRefundKey == nil {
 		return nil, errors.New("taker reverse: incomplete params")
 	}
 	if p.ExpectAsset == "" || p.ExpectSeqAmount == 0 || p.ExpectBtcAmount == 0 {
@@ -156,11 +160,17 @@ func RunTakerReverse(p TakerReverseParams, send XcSend, recv XcRecv) (*TakerReve
 	if err != nil || len(makerBtcRefundPub) != 33 {
 		return res, fmt.Errorf("%w: bad maker_refund_pub", ErrXcBadTerms)
 	}
-	btcTip, err := p.Ops.BtcTip()
+	// Bind the settlement engine to H now that we know it (our SEQ leg script
+	// and BTC claim both embed it).
+	ops, err := p.NewOps(hashH)
 	if err != nil {
 		return res, err
 	}
-	seqTip, err := p.Ops.SeqTip()
+	btcTip, err := ops.BtcTip()
+	if err != nil {
+		return res, err
+	}
+	seqTip, err := ops.SeqTip()
 	if err != nil {
 		return res, err
 	}
@@ -187,7 +197,7 @@ func RunTakerReverse(p TakerReverseParams, send XcSend, recv XcRecv) (*TakerReve
 	var verifiedBtc *xchain.VerifiedBTCLeg
 	confDeadline := time.Now().Add(p.Timing.BtcConfWait)
 	for {
-		verifiedBtc, err = p.Ops.VerifyBTCLeg(hashH, p.BtcClaimKey.PubKey(), makerBtcRefundPub, script,
+		verifiedBtc, err = ops.VerifyBTCLeg(hashH, p.BtcClaimKey.PubKey(), makerBtcRefundPub, script,
 			tBtc, locked.Leg.Txid, locked.Leg.Vout, locked.Leg.Amount, p.MinBTCConf)
 		if err == nil {
 			break
@@ -208,7 +218,7 @@ func RunTakerReverse(p TakerReverseParams, send XcSend, recv XcRecv) (*TakerReve
 	// 4. Fund our SEQ asset leg (claim = the maker's key, refund = ours after
 	// T_seq), persisting the moment it is funded; poll out a slow confirmation
 	// instead of orphaning the leg.
-	seqLeg, seqBlockHash, err := p.Ops.LockSEQLeg(makerSeqClaimPub, p.SeqRefundKey.PubKey(),
+	seqLeg, seqBlockHash, err := ops.LockSEQLeg(makerSeqClaimPub, p.SeqRefundKey.PubKey(),
 		atomsToCoins(p.ExpectSeqAmount), p.ExpectAsset, tSeq)
 	if seqLeg != nil {
 		res.SeqLeg = seqLeg
@@ -224,7 +234,7 @@ func RunTakerReverse(p TakerReverseParams, send XcSend, recv XcRecv) (*TakerReve
 		p.logf("SEQ leg %s funded but slow to confirm; polling: %v", seqLeg.Funded.TxID, err)
 		confirmDeadline := time.Now().Add(p.Timing.SeqLockWait)
 		for seqBlockHash == "" {
-			if bh, berr := p.Ops.SeqBlockHashOfTx(seqLeg.Funded.TxID); berr == nil && bh != "" {
+			if bh, berr := ops.SeqBlockHashOfTx(seqLeg.Funded.TxID); berr == nil && bh != "" {
 				seqBlockHash = bh
 				break
 			}
@@ -239,7 +249,7 @@ func RunTakerReverse(p TakerReverseParams, send XcSend, recv XcRecv) (*TakerReve
 	if p.OnSeqLegFunded != nil {
 		p.OnSeqLegFunded(res)
 	}
-	anchorH, aerr := p.Ops.SeqAnchorHeightOf(seqBlockHash)
+	anchorH, aerr := ops.SeqAnchorHeightOf(seqBlockHash)
 	if aerr != nil {
 		anchorH = 0 // advisory only; the maker gates via its own node
 	}
@@ -267,16 +277,16 @@ func RunTakerReverse(p TakerReverseParams, send XcSend, recv XcRecv) (*TakerReve
 	// (the courier's XcSecretRevealed is deliberately not relied upon). If
 	// T_seq passes unclaimed, refund the asset.
 	for {
-		_, secret, werr := p.Ops.WatchSEQClaim(seqLeg)
+		_, secret, werr := ops.WatchSEQClaim(seqLeg)
 		if werr == nil && len(secret) > 0 {
 			res.Secret = secret
 			break
 		}
-		tip, terr := p.Ops.SeqTip()
+		tip, terr := ops.SeqTip()
 		if terr == nil && uint32(tip) >= tSeq {
-			raw, rerr := p.Ops.RefundSEQLeg(seqLeg, p.SeqRefundKey, tSeq, xcSeqLegFee(p.Ops, p.ExpectAsset, p.SpendFeeSats, p.ExpectSeqAmount))
+			raw, rerr := ops.RefundSEQLeg(seqLeg, p.SeqRefundKey, tSeq, xcSeqLegFee(ops, p.ExpectAsset, p.SpendFeeSats, p.ExpectSeqAmount))
 			if rerr == nil {
-				if txid, berr := p.Ops.SeqBroadcast(raw); berr == nil {
+				if txid, berr := ops.SeqBroadcast(raw); berr == nil {
 					res.SeqRefundTx = txid
 					p.logf("refunded SEQ leg after T_seq: %s", txid)
 					return res, fmt.Errorf("%w: maker never claimed by T_seq %d", ErrXcRefunded, tSeq)
@@ -289,16 +299,16 @@ func RunTakerReverse(p TakerReverseParams, send XcSend, recv XcRecv) (*TakerReve
 
 	// 6. Claim the BTC leg with the revealed secret, retried until the maker's
 	// refund path nears (T_btc); the margin stops a claim-vs-refund race.
-	if err := p.Ops.InjectSecret(res.Secret); err != nil {
+	if err := ops.InjectSecret(res.Secret); err != nil {
 		return res, err
 	}
 	for {
-		tip, terr := p.Ops.BtcTip()
+		tip, terr := ops.BtcTip()
 		if terr == nil && uint32(tip)+p.BtcClaimMargin >= tBtc {
 			return res, fmt.Errorf("btc claim window closed (tip %d within %d of T_btc %d; secret %x persisted)",
 				tip, p.BtcClaimMargin, tBtc, res.Secret)
 		}
-		txid, cerr := p.Ops.ClaimBTCLeg(verifiedBtc.Leg, p.BtcClaimKey, xcSafeFee(p.SpendFeeSats, p.ExpectBtcAmount))
+		txid, cerr := ops.ClaimBTCLeg(verifiedBtc.Leg, p.BtcClaimKey, xcSafeFee(p.SpendFeeSats, p.ExpectBtcAmount))
 		if cerr == nil {
 			res.BtcClaimTxid = txid
 			p.logf("settled: maker claimed our asset, we claimed BTC (%s)", txid)
