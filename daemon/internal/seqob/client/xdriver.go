@@ -805,11 +805,26 @@ func RunMakerForward(p MakerForwardParams, in <-chan []byte, send XcSend) (*Make
 	p.logf("SEQ leg locked: %s in block %s (anchor %d)", seqLeg.Funded.TxID, seqBlockHash, anchorH)
 
 	// 4. Watch for the taker's claim (which reveals the secret) and redeem the
-	// BTC leg — or refund the SEQ leg once T_seq passes without a claim. The
-	// courier is done at this point; everything settles on-chain. The BTC
-	// claim is retried until the parent tip nears T_btc (a ~16 h budget, like
-	// the RFQ watcher), never a fixed handful of attempts: giving up early
-	// while the taker holds the asset hands it the BTC back at T_btc.
+	// BTC leg — or refund the SEQ leg once T_seq passes without a claim. This
+	// is a pure ON-CHAIN loop with no further courier dependency, so it is also
+	// the resume entrypoint (settleMakerForward): a maker that restarts mid-swap
+	// reconstructs the legs/keys from persisted state and re-enters it.
+	return settleMakerForward(ops, res, verifiedBtc.Leg, seqLeg, makerBtcClaim, makerSeqRefund,
+		btcLocktime, seqLocktime, p.AssetHex, p.BtcAmount, p.SeqAmount, p.SpendFeeSats, p.Timing,
+		func(code, msg string) { sendXcFail(p.Crypter, send, code, msg) }, p.OnUpdate, p.logf)
+}
+
+// settleMakerForward is the maker's on-chain settle loop, shared by
+// RunMakerForward (live) and ResumeMakerForward (post-restart). It watches the
+// maker's SEQ leg for the taker's claim (which reveals the secret) and redeems
+// the taker's BTC leg, or refunds the SEQ leg once T_seq passes. res is mutated
+// and returned; onUpdate persists each transition. onRefundNote couriers an
+// advisory XcFail if a live session is still attached (nil-safe).
+func settleMakerForward(ops XcOps, res *MakerForwardResult, btcLeg, seqLeg *xchain.LegLock,
+	makerBtcClaim, makerSeqRefund *xchain.Key, btcLocktime, seqLocktime uint32,
+	assetHex string, btcAmount, seqAmount, spendFeeSats uint64, timing XcTiming,
+	onRefundNote func(code, msg string), onUpdate func(*MakerForwardResult), logf func(string, ...interface{})) (*MakerForwardResult, error) {
+	timing.setDefaults()
 	for {
 		claimTxid, secret, werr := ops.WatchSEQClaim(seqLeg)
 		if werr == nil && len(secret) > 0 {
@@ -817,42 +832,87 @@ func RunMakerForward(p MakerForwardParams, in <-chan []byte, send XcSend) (*Make
 				return res, err
 			}
 			res.Secret = secret
-			if p.OnUpdate != nil {
-				p.OnUpdate(res)
+			if onUpdate != nil {
+				onUpdate(res)
 			}
-			btcClaimTxid, cerr := ops.ClaimBTCLeg(verifiedBtc.Leg, makerBtcClaim, xcSafeFee(p.SpendFeeSats, p.BtcAmount))
+			btcClaimTxid, cerr := ops.ClaimBTCLeg(btcLeg, makerBtcClaim, xcSafeFee(spendFeeSats, btcAmount))
 			if cerr != nil {
 				if tip, terr := ops.BtcTip(); terr == nil && uint32(tip) >= btcLocktime-6 {
 					return res, fmt.Errorf("btc claim still failing near T_btc %d (secret persisted): %w", btcLocktime, cerr)
 				}
-				p.logf("btc claim retrying: %v", cerr)
-				time.Sleep(p.Timing.Poll)
+				logf("btc claim retrying: %v", cerr)
+				time.Sleep(timing.Poll)
 				continue
 			}
 			res.BtcClaimTxid = btcClaimTxid
 			res.Settled = true
-			if p.OnUpdate != nil {
-				p.OnUpdate(res)
+			if onUpdate != nil {
+				onUpdate(res)
 			}
-			p.logf("settled: taker claimed SEQ (%s), we claimed BTC (%s)", claimTxid, btcClaimTxid)
+			logf("settled: taker claimed SEQ (%s), we claimed BTC (%s)", claimTxid, btcClaimTxid)
 			return res, nil
 		}
-		tip, terr := p.SeqTip()
+		tip, terr := ops.SeqTip()
 		if terr == nil && uint32(tip) >= seqLocktime {
-			raw, rerr := ops.RefundSEQLeg(seqLeg, makerSeqRefund, seqLocktime, xcSeqLegFee(ops, p.AssetHex, p.SpendFeeSats, p.SeqAmount))
+			raw, rerr := ops.RefundSEQLeg(seqLeg, makerSeqRefund, seqLocktime, xcSeqLegFee(ops, assetHex, spendFeeSats, seqAmount))
 			if rerr == nil {
 				if txid, berr := ops.SeqBroadcast(raw); berr == nil {
 					res.SeqRefundTx = txid
-					if p.OnUpdate != nil {
-						p.OnUpdate(res)
+					if onUpdate != nil {
+						onUpdate(res)
 					}
-					sendXcFail(p.Crypter, send, "refunded", "seq leg refunded after T_seq")
-					p.logf("refunded SEQ leg after T_seq: %s", txid)
+					if onRefundNote != nil {
+						onRefundNote("refunded", "seq leg refunded after T_seq")
+					}
+					logf("refunded SEQ leg after T_seq: %s", txid)
 					return res, fmt.Errorf("%w: no claim by T_seq %d", ErrXcRefunded, seqLocktime)
 				}
 			}
 			// Build/broadcast hiccup: retry next tick until it lands.
 		}
-		time.Sleep(p.Timing.Poll)
+		time.Sleep(timing.Poll)
 	}
+}
+
+// MakerForwardResumeParams reconstructs a maker forward session from persisted
+// state after a restart. All legs/keys/locktimes come from the on-disk record;
+// the driver re-enters the on-chain settle loop with no courier.
+type MakerForwardResumeParams struct {
+	Ops          XcOps
+	BtcLeg       *xchain.LegLock // the taker's BTC leg (we claim it with the secret)
+	SeqLeg       *xchain.LegLock // our asset leg (we watch it / refund it)
+	BtcClaimKey  *xchain.Key
+	SeqRefundKey *xchain.Key
+	HashH        []byte
+	BtcLocktime  uint32
+	SeqLocktime  uint32
+	AssetHex     string
+	BtcAmount    uint64
+	SeqAmount    uint64
+	SpendFeeSats uint64
+	Timing       XcTiming
+	OnUpdate     func(*MakerForwardResult)
+	Log          func(string, ...interface{})
+}
+
+// ResumeMakerForward finishes a maker forward session after a restart: it drives
+// the same on-chain settle loop RunMakerForward ends with, so a mid-swap crash
+// or courier timeout completes (claim on the taker's reveal) or refunds (after
+// T_seq) instead of stranding the maker's asset leg.
+func ResumeMakerForward(p MakerForwardResumeParams) (*MakerForwardResult, error) {
+	if p.Ops == nil || p.BtcLeg == nil || p.SeqLeg == nil || p.BtcClaimKey == nil || p.SeqRefundKey == nil {
+		return nil, errors.New("maker forward resume: incomplete state")
+	}
+	logf := func(string, ...interface{}) {}
+	if p.Log != nil {
+		logf = p.Log
+	}
+	res := &MakerForwardResult{
+		HashH: p.HashH, BtcClaimKey: p.BtcClaimKey, SeqRefundKey: p.SeqRefundKey,
+		BtcLocktime: p.BtcLocktime, SeqLocktime: p.SeqLocktime,
+		BtcLeg: p.BtcLeg, SeqLeg: p.SeqLeg,
+	}
+	return settleMakerForward(p.Ops, res, p.BtcLeg, p.SeqLeg, p.BtcClaimKey, p.SeqRefundKey,
+		p.BtcLocktime, p.SeqLocktime, p.AssetHex, p.BtcAmount, p.SeqAmount, p.SpendFeeSats,
+		p.Timing, nil, p.OnUpdate, logf)
 }

@@ -709,3 +709,65 @@ func TestReverseTakerRefundsWithoutMakerClaim(t *testing.T) {
 		t.Fatalf("taker asset refund not broadcast: %+v", res)
 	}
 }
+
+// TestResumeMakerForwardSettles proves a maker that "restarted" (only persisted
+// legs/keys, no live courier) still claims the BTC leg when the taker's SEQ
+// claim reveals the secret on-chain.
+func TestResumeMakerForwardSettles(t *testing.T) {
+	secret := make([]byte, 32)
+	secret[0] = 9
+	h := sha256.Sum256(secret)
+	st := &fakeChainState{btcTip: 1000, seqTip: 5000, btcConfs: map[string]int{"btc-htlc": 3}, seqClaimedBy: secret}
+	ops := (&fakeOps{st: st, hashH: h[:]}).withSecret(secret)
+	res, err := ResumeMakerForward(MakerForwardResumeParams{
+		Ops:          ops,
+		BtcLeg:       &xchain.LegLock{Script: []byte("btc"), Funded: &xchain.FundedHTLC{TxID: "btc-htlc", Vout: 0, Amount: 25000}, Locktime: 1100},
+		SeqLeg:       &xchain.LegLock{Script: []byte("seq"), Funded: &xchain.FundedHTLC{TxID: "seq-htlc", Vout: 1, Amount: 5000000, AssetID: testAsset}, Locktime: 5240},
+		BtcClaimKey:  mustKey(t),
+		SeqRefundKey: mustKey(t),
+		HashH:        h[:],
+		BtcLocktime:  1100,
+		SeqLocktime:  5240,
+		AssetHex:     testAsset,
+		BtcAmount:    25000,
+		SeqAmount:    5000000,
+		Timing:       XcTiming{Poll: 2 * time.Millisecond},
+	})
+	if err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if !res.Settled || res.BtcClaimTxid != "btc-claim" {
+		t.Fatalf("resume did not settle: %+v", res)
+	}
+	if string(res.Secret) != string(secret) {
+		t.Fatalf("resume learned the wrong secret")
+	}
+}
+
+// TestResumeMakerForwardRefunds proves a maker resume refunds the SEQ leg when
+// T_seq has passed with no taker claim.
+func TestResumeMakerForwardRefunds(t *testing.T) {
+	h := sha256.Sum256([]byte("nobody-claims"))
+	st := &fakeChainState{btcTip: 1000, seqTip: 5241, btcConfs: map[string]int{}} // seqTip already past T_seq
+	ops := &fakeOps{st: st, hashH: h[:]}
+	res, err := ResumeMakerForward(MakerForwardResumeParams{
+		Ops:          ops,
+		BtcLeg:       &xchain.LegLock{Script: []byte("btc"), Funded: &xchain.FundedHTLC{TxID: "btc-htlc", Vout: 0, Amount: 25000}, Locktime: 1100},
+		SeqLeg:       &xchain.LegLock{Script: []byte("seq"), Funded: &xchain.FundedHTLC{TxID: "seq-htlc", Vout: 1, Amount: 5000000, AssetID: testAsset}, Locktime: 5240},
+		BtcClaimKey:  mustKey(t),
+		SeqRefundKey: mustKey(t),
+		HashH:        h[:],
+		BtcLocktime:  1100,
+		SeqLocktime:  5240,
+		AssetHex:     testAsset,
+		BtcAmount:    25000,
+		SeqAmount:    5000000,
+		Timing:       XcTiming{Poll: 2 * time.Millisecond},
+	})
+	if err == nil || !errors.Is(err, ErrXcRefunded) {
+		t.Fatalf("want ErrXcRefunded, got %v", err)
+	}
+	if res.SeqRefundTx != "seq-refund" {
+		t.Fatalf("resume did not refund: %+v", res)
+	}
+}

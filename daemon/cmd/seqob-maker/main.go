@@ -76,7 +76,15 @@ func main() {
 	minBTCConf := flag.Int("min-btc-conf", 1, "cross: confirmations required on the taker's BTC leg (1 = testnet-grade; confirmation depth, not anchoring, protects the maker's BTC side — raise for real value)")
 	spendFee := flag.Uint64("spend-fee", 1000, "cross: HTLC spend fee target in native sats (converted per-asset via the fee market)")
 	xstateDir := flag.String("xstate-dir", "xmaker-sessions", "cross: directory for per-lift session state (keys/legs; the recovery material)")
+	resume := flag.Bool("resume", false, "cross: instead of serving, finish every non-terminal session in -xstate-dir (post-restart on-chain claim/refund) and exit")
 	flag.Parse()
+
+	// Cross resume needs no maker key or offer: it drives on-chain settlement
+	// from persisted per-session keys. Handle it before the key/offer setup.
+	if strings.ToLower(*mode) == "cross" && *resume {
+		resumeCrossSessions(*xstateDir, *btcRPCURL, *btcWallet, *btcChainName, *xseqRPCURL, *xseqWallet, *spendFee)
+		return
+	}
 
 	cross := strings.ToLower(*mode) == "cross"
 	if !cross && *account == "" {
@@ -305,6 +313,149 @@ func buildCrossOffer(asset, side string, assetAmt, btcAmt uint64, feeAsset strin
 		o.WantAsset, o.WantAmount = asset, assetAmt
 	}
 	return o
+}
+
+// resumeCrossSessions finishes every non-terminal cross session persisted in
+// dir after a restart: it reconstructs the legs/keys from each <sid>.json and
+// re-enters the on-chain settle loop (claim on the taker's reveal, or refund
+// after the CLTV). This is the 2f recovery path — a mid-swap crash or courier
+// timeout no longer strands the maker's asset leg. FORWARD sessions only for
+// now (the direction served today); reverse resume lands with reverse serving.
+func resumeCrossSessions(dir, btcRPCURL, btcWallet, btcChainName, seqRPCURL, seqWallet string, spendFee uint64) {
+	if btcRPCURL == "" || seqRPCURL == "" {
+		fatal("-resume requires -btc-rpc and -xseq-rpc")
+	}
+	btcRPC, err := rpcFromURL(btcRPCURL)
+	if err != nil {
+		fatal("-btc-rpc: %v", err)
+	}
+	seqRPC, err := rpcFromURL(seqRPCURL)
+	if err != nil {
+		fatal("-xseq-rpc: %v", err)
+	}
+	params, err := xchain.BitcoinChainParams(btcChainName)
+	if err != nil {
+		fatal("-btc-chain: %v", err)
+	}
+	btcChain := xchain.NewBitcoinChain(btcRPC, btcWallet, params)
+	seqChain := xchain.NewChain(seqRPC, seqWallet)
+
+	entries, err := ioutil.ReadDir(dir)
+	if err != nil {
+		fatal("read -xstate-dir %s: %v", dir, err)
+	}
+	var pending []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".json") {
+			pending = append(pending, e.Name())
+		}
+	}
+	if len(pending) == 0 {
+		fmt.Printf("no cross sessions to resume in %s\n", dir)
+		return
+	}
+	fmt.Printf("resuming %d cross session(s) from %s\n", len(pending), dir)
+
+	var wg sync.WaitGroup
+	for _, name := range pending {
+		path := filepath.Join(dir, name)
+		raw, rerr := ioutil.ReadFile(path)
+		if rerr != nil {
+			fmt.Printf("%s: read: %v\n", name, rerr)
+			continue
+		}
+		var st xmakerSessionState
+		if jerr := json.Unmarshal(raw, &st); jerr != nil {
+			fmt.Printf("%s: parse: %v\n", name, jerr)
+			continue
+		}
+		if st.Settled || st.SeqRefundTx != "" {
+			fmt.Printf("%s: already terminal (settled=%v refund=%s); skipping\n", name, st.Settled, st.SeqRefundTx)
+			continue
+		}
+		if st.SeqLegTxid == "" || st.SeqLegScriptHex == "" || st.BtcClaimPrivHex == "" || st.SeqRefundPrivHex == "" {
+			fmt.Printf("%s: no locked SEQ leg / keys to resume (session died before lock); nothing on-chain to settle\n", name)
+			continue
+		}
+		p, perr := resumeParamsFromState(&st, btcChain, seqChain, spendFee, dir)
+		if perr != nil {
+			fmt.Printf("%s: reconstruct: %v\n", name, perr)
+			continue
+		}
+		wg.Add(1)
+		go func(name string, p client.MakerForwardResumeParams) {
+			defer wg.Done()
+			fmt.Printf("%s: resuming on-chain settle loop\n", name)
+			res, rerr := client.ResumeMakerForward(p)
+			if rerr != nil {
+				fmt.Printf("%s: resume ended: %v\n", name, rerr)
+				if res != nil && res.SeqRefundTx != "" {
+					fmt.Printf("%s: SEQ leg refunded in %s\n", name, res.SeqRefundTx)
+				}
+				return
+			}
+			fmt.Printf("%s: RESUMED + SETTLED: BTC claimed in %s\n", name, res.BtcClaimTxid)
+		}(name, p)
+	}
+	wg.Wait()
+	fmt.Println("resume pass complete")
+}
+
+// resumeParamsFromState rebuilds the resume params (legs, keys, swap) from a
+// persisted session record.
+func resumeParamsFromState(st *xmakerSessionState, btcChain *xchain.BitcoinChain, seqChain *xchain.Chain,
+	spendFee uint64, dir string) (client.MakerForwardResumeParams, error) {
+	var zero client.MakerForwardResumeParams
+	hashH, err := hex.DecodeString(st.HashHex)
+	if err != nil || len(hashH) != 32 {
+		return zero, fmt.Errorf("bad hash_hex")
+	}
+	btcClaimBytes, err := hex.DecodeString(st.BtcClaimPrivHex)
+	if err != nil {
+		return zero, fmt.Errorf("bad btc_claim_priv_hex")
+	}
+	seqRefundBytes, err := hex.DecodeString(st.SeqRefundPrivHex)
+	if err != nil {
+		return zero, fmt.Errorf("bad seq_refund_priv_hex")
+	}
+	btcScript, err := hex.DecodeString(st.BtcLegScriptHex)
+	if err != nil {
+		return zero, fmt.Errorf("bad btc_leg_script_hex")
+	}
+	seqScript, err := hex.DecodeString(st.SeqLegScriptHex)
+	if err != nil {
+		return zero, fmt.Errorf("bad seq_leg_script_hex")
+	}
+	sid := st.SessionID
+	return client.MakerForwardResumeParams{
+		Ops: &client.LiveXcOps{
+			Swap: xchain.NewSwapBitcoin(btcChain, seqChain, xchain.NewHashLockFromHash(hashH)),
+			BTC:  btcChain, SEQ: seqChain,
+		},
+		BtcLeg: &xchain.LegLock{
+			Script:   btcScript,
+			Funded:   &xchain.FundedHTLC{TxID: st.BtcLegTxid, Vout: st.BtcLegVout, Amount: st.BtcLegAmount},
+			Locktime: st.BtcLocktime,
+		},
+		SeqLeg: &xchain.LegLock{
+			Script:   seqScript,
+			Funded:   &xchain.FundedHTLC{TxID: st.SeqLegTxid, Vout: st.SeqLegVout, Amount: st.SeqLegAmount, AssetID: st.SeqLegAsset},
+			Locktime: st.SeqLocktime,
+		},
+		BtcClaimKey:  xchain.KeyFromBytes(btcClaimBytes),
+		SeqRefundKey: xchain.KeyFromBytes(seqRefundBytes),
+		HashH:        hashH,
+		BtcLocktime:  st.BtcLocktime,
+		SeqLocktime:  st.SeqLocktime,
+		AssetHex:     st.SeqLegAsset,
+		BtcAmount:    st.BtcLegAmount,
+		SeqAmount:    st.SeqLegAmount,
+		SpendFeeSats: spendFee,
+		OnUpdate: func(r *client.MakerForwardResult) {
+			persistXSession(dir, sid, st.OfferID, r)
+		},
+		Log: func(format string, args ...interface{}) { fmt.Printf("session "+sid+": "+format+"\n", args...) },
+	}, nil
 }
 
 // swapReqAdapter adapts a seqob *seqdexv1.SwapRequest to ports.SwapRequest. The
