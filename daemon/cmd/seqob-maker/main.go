@@ -75,6 +75,7 @@ func main() {
 	seqDelta := flag.Uint("seq-locktime-delta", 240, "cross: T_seq = SEQ tip + this (shorter leg in time; ~2h — must cover the taker's real parent confirmation, or takers refuse the terms)")
 	minBTCConf := flag.Int("min-btc-conf", 1, "cross: confirmations required on the taker's BTC leg (1 = testnet-grade; confirmation depth, not anchoring, protects the maker's BTC side — raise for real value)")
 	spendFee := flag.Uint64("spend-fee", 1000, "cross: HTLC spend fee target in native sats (converted per-asset via the fee market)")
+	btcFeeRate := flag.Float64("btc-fee-rate", 2, "cross: sat/vB fee rate for funding the BTC HTLC leg (explicit, so it never depends on the node's estimatesmartfee/settxfee; 0 = node default)")
 	xstateDir := flag.String("xstate-dir", "xmaker-sessions", "cross: directory for per-lift session state (keys/legs; the recovery material)")
 	resume := flag.Bool("resume", false, "cross: instead of serving, finish every non-terminal session in -xstate-dir (post-restart on-chain claim/refund) and exit")
 	flag.Parse()
@@ -82,7 +83,7 @@ func main() {
 	// Cross resume needs no maker key or offer: it drives on-chain settlement
 	// from persisted per-session keys. Handle it before the key/offer setup.
 	if strings.ToLower(*mode) == "cross" && *resume {
-		resumeCrossSessions(*xstateDir, *btcRPCURL, *btcWallet, *btcChainName, *xseqRPCURL, *xseqWallet, *spendFee)
+		resumeCrossSessions(*xstateDir, *btcRPCURL, *btcWallet, *btcChainName, *xseqRPCURL, *xseqWallet, *spendFee, *btcFeeRate)
 		return
 	}
 
@@ -104,6 +105,7 @@ func main() {
 			seqRPCURL: *xseqRPCURL, seqWallet: *xseqWallet,
 			btcDelta: uint32(*btcDelta), seqDelta: uint32(*seqDelta),
 			minBTCConf: *minBTCConf, spendFee: *spendFee, stateDir: *xstateDir,
+			btcFeeRate: *btcFeeRate,
 		})
 		return
 	}
@@ -321,7 +323,7 @@ func buildCrossOffer(asset, side string, assetAmt, btcAmt uint64, feeAsset strin
 // after the CLTV). This is the 2f recovery path — a mid-swap crash or courier
 // timeout no longer strands the maker's asset leg. FORWARD sessions only for
 // now (the direction served today); reverse resume lands with reverse serving.
-func resumeCrossSessions(dir, btcRPCURL, btcWallet, btcChainName, seqRPCURL, seqWallet string, spendFee uint64) {
+func resumeCrossSessions(dir, btcRPCURL, btcWallet, btcChainName, seqRPCURL, seqWallet string, spendFee uint64, btcFeeRate float64) {
 	if btcRPCURL == "" || seqRPCURL == "" {
 		fatal("-resume requires -btc-rpc and -xseq-rpc")
 	}
@@ -338,6 +340,7 @@ func resumeCrossSessions(dir, btcRPCURL, btcWallet, btcChainName, seqRPCURL, seq
 		fatal("-btc-chain: %v", err)
 	}
 	btcChain := xchain.NewBitcoinChain(btcRPC, btcWallet, params)
+	btcChain.SetFeeRate(btcFeeRate)
 	seqChain := xchain.NewChain(seqRPC, seqWallet)
 
 	entries, err := ioutil.ReadDir(dir)
@@ -650,6 +653,7 @@ type crossMakerConfig struct {
 	minBTCConf   int
 	spendFee     uint64
 	stateDir     string
+	btcFeeRate   float64
 }
 
 // runCrossMaker posts a cross-chain offer and serves forward lifts with the
@@ -677,6 +681,7 @@ func runCrossMaker(cfg crossMakerConfig) {
 		fatal("-btc-chain: %v", err)
 	}
 	btcChain := xchain.NewBitcoinChain(btcRPC, cfg.btcWallet, params)
+	btcChain.SetFeeRate(cfg.btcFeeRate)
 	seqChain := xchain.NewChain(seqRPC, cfg.seqWallet)
 
 	// Sanity: both nodes reachable before we advertise anything.

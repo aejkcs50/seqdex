@@ -83,6 +83,7 @@ func cmdXLift(args []string) {
 	seqWallet := fs.String("seq-wallet", "", "Sequentia node wallet receiving the asset")
 	minBTCConf := fs.Int("min-btc-conf", 1, "confirmations on our BTC leg before announcing it")
 	spendFee := fs.Uint64("spend-fee", 1000, "HTLC spend fee target in native sats (converted per-asset)")
+	btcFeeRate := fs.Float64("btc-fee-rate", 2, "sat/vB fee rate for funding the BTC HTLC leg (explicit; 0 = node default)")
 	maxFeeBtc := fs.Uint64("max-fee-btc", 0, "max maker fee_btc (sats) we accept")
 	stateFile := fs.String("state-file", "xlift-session.json", "session persistence (refund needs this)")
 	btcConfWait := fs.Duration("btc-conf-wait", 90*time.Minute, "max wait for our BTC leg to confirm")
@@ -140,6 +141,7 @@ func cmdXLift(args []string) {
 		fatal("-btc-chain: %v", err)
 	}
 	btcChain := xchain.NewBitcoinChain(btcRPC, *btcWallet, params)
+	btcChain.SetFeeRate(*btcFeeRate)
 	seqChain := xchain.NewChain(seqRPC, *seqWallet)
 
 	// 3. Secret + throwaway settlement keys, persisted BEFORE any coins move.

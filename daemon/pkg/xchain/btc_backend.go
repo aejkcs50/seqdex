@@ -237,7 +237,15 @@ func (b *bitcoinBTCBackend) LockBTCLeg(script []byte, amountCoins string, lockti
 		return nil, 0, err
 	}
 	var txid string
-	if err := b.chain.RPC().Call(&txid, "sendtoaddress", addr, amountCoins); err != nil {
+	if fr := b.chain.FeeRate(); fr > 0 {
+		// Explicit fee_rate (sat/vB) so funding never depends on the node's
+		// estimatesmartfee or a manual settxfee. sendtoaddress's named-arg form
+		// takes fee_rate directly (Bitcoin Core v0.21+; testnet4 is v28+).
+		named := map[string]interface{}{"address": addr, "amount": amountCoins, "fee_rate": fr}
+		if err := b.chain.RPC().CallNamed(&txid, "sendtoaddress", named); err != nil {
+			return nil, 0, err
+		}
+	} else if err := b.chain.RPC().Call(&txid, "sendtoaddress", addr, amountCoins); err != nil {
 		return nil, 0, err
 	}
 

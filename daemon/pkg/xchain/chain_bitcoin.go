@@ -22,7 +22,18 @@ import (
 type BitcoinChain struct {
 	rpc    *RPC
 	params *chaincfg.Params
+	// feeRateSatVb, when > 0, is passed as sendtoaddress's fee_rate (sat/vB) when
+	// funding an HTLC leg, so the daemon sets its own fee instead of relying on
+	// the node's estimatesmartfee (unavailable on sparse testnet4 without
+	// -fallbackfee) or a manual settxfee. 0 keeps the node's default behavior.
+	feeRateSatVb float64
 }
+
+// SetFeeRate sets the sat/vB fee rate used when funding HTLC legs.
+func (c *BitcoinChain) SetFeeRate(satVb float64) { c.feeRateSatVb = satVb }
+
+// FeeRate returns the configured HTLC funding fee rate (sat/vB), 0 if unset.
+func (c *BitcoinChain) FeeRate() float64 { return c.feeRateSatVb }
 
 // NewBitcoinChain binds a BitcoinChain to a bitcoind RPC + wallet and chain
 // params (regtest/testnet4). The wallet is used for getnewaddress

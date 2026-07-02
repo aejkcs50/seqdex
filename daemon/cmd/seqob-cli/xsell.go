@@ -73,6 +73,7 @@ func cmdXSell(args []string) {
 	seqWallet := fs.String("seq-wallet", "", "Sequentia node wallet funding the asset leg")
 	minBTCConf := fs.Int("min-btc-conf", 1, "confirmations required on the maker's BTC leg before we fund the asset")
 	spendFee := fs.Uint64("spend-fee", 1000, "HTLC spend fee target in native sats (converted per-asset)")
+	btcFeeRate := fs.Float64("btc-fee-rate", 2, "sat/vB fee rate for BTC-side spends (explicit; 0 = node default)")
 	maxFeeBtc := fs.Uint64("max-fee-btc", 0, "max maker fee_btc (sats) we accept")
 	stateFile := fs.String("state-file", "xsell-session.json", "session persistence (refund needs this)")
 	_ = fs.Parse(args)
@@ -126,6 +127,7 @@ func cmdXSell(args []string) {
 		fatal("-btc-chain: %v", err)
 	}
 	btcChain := xchain.NewBitcoinChain(btcRPC, *btcWallet, params)
+	btcChain.SetFeeRate(*btcFeeRate)
 	seqChain := xchain.NewChain(seqRPC, *seqWallet)
 
 	// 2. Throwaway settlement keys, persisted before any coins move.
