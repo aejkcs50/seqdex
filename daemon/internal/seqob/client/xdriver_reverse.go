@@ -636,3 +636,161 @@ func RunMakerReverse(p MakerReverseParams, in <-chan []byte, send XcSend) (*Make
 	p.logf("settled: claimed the asset in %s (secret revealed; taker claims the BTC leg)", claimTxid)
 	return res, nil
 }
+
+// --- REVERSE maker resume (post-restart) -------------------------------------
+
+// MakerReverseResumeParams reconstructs a reverse maker session from persisted
+// state. The maker holds the secret and has funded the BTC leg; depending on how
+// far the swap got, resume either claims the taker's asset leg (if the taker
+// funded it and it is still claimable before T_seq) or refunds the maker's own
+// BTC leg after T_btc. All material comes from the on-disk record.
+type MakerReverseResumeParams struct {
+	Ops          XcOps
+	BtcLeg       *xchain.LegLock // ours; refunded after T_btc if we cannot settle
+	SeqLeg       *xchain.LegLock // the taker's asset leg (nil if never funded/verified)
+	SeqBlockHash string          // the taker leg's confirming block (for the anchor gate)
+	Secret       []byte
+	HashH        []byte
+	SeqClaimKey  *xchain.Key // claims the taker's asset leg (reveals the secret)
+	BtcRefundKey *xchain.Key // refunds our BTC leg after T_btc
+	BtcLocktime  uint32
+	SeqLocktime  uint32
+	AssetHex     string
+	BtcAmount    uint64
+	SeqAmount    uint64
+	SeqClaimMargin uint32
+	MinBTCConf     int
+	SpendFeeSats   uint64
+	Timing         XcTiming
+	OnUpdate       func(*MakerReverseResult)
+	Log            func(string, ...interface{})
+}
+
+// ResumeMakerReverse finishes a reverse maker session after a restart. If the
+// taker's asset leg is present and still claimable, it anchor-gates and claims
+// it (revealing the secret; the taker then claims BTC). Otherwise it refunds the
+// maker's BTC leg once T_btc passes. Claim and refund are mutually exclusive, so
+// the secret is never revealed on a path we also refund.
+func ResumeMakerReverse(p MakerReverseResumeParams) (*MakerReverseResult, error) {
+	if p.Ops == nil || p.BtcLeg == nil || p.BtcRefundKey == nil {
+		return nil, errors.New("maker reverse resume: incomplete state")
+	}
+	p.Timing.setDefaults()
+	if p.SeqClaimMargin == 0 {
+		p.SeqClaimMargin = 10
+	}
+	if p.MinBTCConf <= 0 {
+		p.MinBTCConf = 1
+	}
+	if p.SpendFeeSats == 0 {
+		p.SpendFeeSats = 1000
+	}
+	logf := func(string, ...interface{}) {}
+	if p.Log != nil {
+		logf = p.Log
+	}
+	res := &MakerReverseResult{
+		Secret: p.Secret, HashH: p.HashH,
+		SeqClaimKey: p.SeqClaimKey, BtcRefundKey: p.BtcRefundKey,
+		BtcLocktime: p.BtcLocktime, SeqLocktime: p.SeqLocktime,
+		BtcLeg: p.BtcLeg, SeqLeg: p.SeqLeg, SeqBlockHash: p.SeqBlockHash,
+	}
+
+	// Try to claim the taker's asset leg if we have it and can still do so
+	// safely before T_seq. Anything that prevents a safe claim falls through to
+	// the BTC refund.
+	if p.SeqLeg != nil && p.SeqClaimKey != nil && len(p.Secret) == 32 && p.SeqBlockHash != "" {
+		claimed, err := resumeReverseTryClaim(p, res, logf)
+		if err != nil {
+			return res, err
+		}
+		if claimed {
+			return res, nil
+		}
+	} else {
+		logf("reverse resume: no claimable asset leg (taker never funded / not verified); will refund the BTC leg after T_btc %d", p.BtcLocktime)
+	}
+
+	// Refund our BTC leg once T_btc passes. By then T_seq (the shorter leg) has
+	// also passed, so the taker has already (or will) refund its asset leg — no
+	// double-settlement.
+	for {
+		tip, err := p.Ops.BtcTip()
+		if err != nil {
+			return res, err
+		}
+		if uint32(tip) >= p.BtcLocktime {
+			break
+		}
+		time.Sleep(p.Timing.Poll)
+	}
+	txid, err := p.Ops.RefundBTCLeg(p.BtcLeg, p.BtcRefundKey, p.BtcLocktime, xcSafeFee(p.SpendFeeSats, p.BtcAmount))
+	if err != nil {
+		return res, fmt.Errorf("btc refund after T_btc %d: %w", p.BtcLocktime, err)
+	}
+	res.BtcRefundTx = txid
+	if p.OnUpdate != nil {
+		p.OnUpdate(res)
+	}
+	logf("reverse resume: refunded BTC leg after T_btc: %s", txid)
+	return res, fmt.Errorf("%w: reverse lift refunded (btc %s)", ErrXcRefunded, txid)
+}
+
+// resumeReverseTryClaim measures the BTC-leg height, runs the anchor gate, checks
+// the T_seq margin, and claims the taker's asset leg. Returns (true, nil) on a
+// successful claim; (false, nil) means "cannot claim safely, refund BTC instead".
+func resumeReverseTryClaim(p MakerReverseResumeParams, res *MakerReverseResult, logf func(string, ...interface{})) (bool, error) {
+	// Our BTC leg's confirmation height for the anchor ordering check.
+	var btcLegHeight int64
+	hDeadline := time.Now().Add(p.Timing.BtcConfWait)
+	for {
+		confs, cerr := p.Ops.BtcConfirmations(p.BtcLeg.Funded.TxID)
+		if cerr == nil && confs >= p.MinBTCConf {
+			if tip, terr := p.Ops.BtcTip(); terr == nil {
+				btcLegHeight = tip - int64(confs) + 1
+				break
+			}
+		}
+		if time.Now().After(hDeadline) {
+			logf("reverse resume: own BTC leg never reached %d conf; refunding", p.MinBTCConf)
+			return false, nil
+		}
+		time.Sleep(p.Timing.Poll)
+	}
+	// Anchor gate on the taker leg's confirming block.
+	anchorDeadline := time.Now().Add(p.Timing.AnchorWait)
+	for {
+		if _, err := p.Ops.VerifySeqLegSafe(p.SeqBlockHash, btcLegHeight); err == nil {
+			break
+		}
+		if time.Now().After(anchorDeadline) {
+			logf("reverse resume: anchor gate did not pass; refunding BTC instead of revealing the secret")
+			return false, nil
+		}
+		time.Sleep(p.Timing.Poll)
+	}
+	// Never reveal the secret inside the T_seq margin (the taker could be
+	// refunding its asset leg).
+	tip, err := p.Ops.SeqTip()
+	if err != nil {
+		return false, err
+	}
+	if uint32(tip)+p.SeqClaimMargin >= p.SeqLocktime {
+		logf("reverse resume: within %d of T_seq %d; too late to claim safely, refunding BTC", p.SeqClaimMargin, p.SeqLocktime)
+		return false, nil
+	}
+	if err := p.Ops.InjectSecret(p.Secret); err != nil {
+		return false, err
+	}
+	txid, err := p.Ops.ClaimSEQLeg(p.SeqLeg, p.SeqClaimKey, xcSeqLegFee(p.Ops, p.AssetHex, p.SpendFeeSats, p.SeqAmount))
+	if err != nil {
+		return false, fmt.Errorf("seq claim on resume: %w", err)
+	}
+	res.SeqClaimTxid = txid
+	res.Settled = true
+	if p.OnUpdate != nil {
+		p.OnUpdate(res)
+	}
+	logf("reverse resume: claimed the taker's asset leg %s (secret revealed)", txid)
+	return true, nil
+}

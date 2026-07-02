@@ -707,3 +707,66 @@ func TestResumeMakerForwardRefunds(t *testing.T) {
 		t.Fatalf("resume did not refund: %+v", res)
 	}
 }
+
+// TestResumeMakerReverseClaims proves reverse resume claims the taker's asset
+// leg (revealing the secret) when it is present and still claimable.
+func TestResumeMakerReverseClaims(t *testing.T) {
+	secret := make([]byte, 32)
+	secret[0] = 5
+	h := sha256.Sum256(secret)
+	st := &fakeChainState{btcTip: 2000, seqTip: 8000, btcConfs: map[string]int{"btc-htlc": 3}}
+	ops := (&fakeOps{st: st, hashH: h[:]}).withSecret(secret)
+	res, err := ResumeMakerReverse(MakerReverseResumeParams{
+		Ops:          ops,
+		BtcLeg:       &xchain.LegLock{Script: []byte("btc"), Funded: &xchain.FundedHTLC{TxID: "btc-htlc", Vout: 0, Amount: 25000}, Locktime: 2100},
+		SeqLeg:       &xchain.LegLock{Script: []byte("seq"), Funded: &xchain.FundedHTLC{TxID: "seq-htlc", Vout: 1, Amount: 5000000, AssetID: testAsset}, Locktime: 8240},
+		SeqBlockHash: "seq-block-hash",
+		Secret:       secret,
+		HashH:        h[:],
+		SeqClaimKey:  mustKey(t),
+		BtcRefundKey: mustKey(t),
+		BtcLocktime:  2100,
+		SeqLocktime:  8240,
+		AssetHex:     testAsset,
+		BtcAmount:    25000,
+		SeqAmount:    5000000,
+		Timing:       XcTiming{Poll: 2 * time.Millisecond},
+	})
+	if err != nil {
+		t.Fatalf("reverse resume: %v", err)
+	}
+	if !res.Settled || res.SeqClaimTxid != "seq-claim" {
+		t.Fatalf("reverse resume did not claim: %+v", res)
+	}
+}
+
+// TestResumeMakerReverseRefundsBtc proves reverse resume refunds the maker's BTC
+// leg when the taker never funded the asset leg and T_btc has passed.
+func TestResumeMakerReverseRefundsBtc(t *testing.T) {
+	secret := make([]byte, 32)
+	secret[0] = 6
+	h := sha256.Sum256(secret)
+	st := &fakeChainState{btcTip: 2100, seqTip: 8000, btcConfs: map[string]int{}} // btcTip already at T_btc
+	ops := (&fakeOps{st: st, hashH: h[:]}).withSecret(secret)
+	res, err := ResumeMakerReverse(MakerReverseResumeParams{
+		Ops:          ops,
+		BtcLeg:       &xchain.LegLock{Script: []byte("btc"), Funded: &xchain.FundedHTLC{TxID: "btc-htlc", Vout: 0, Amount: 25000}, Locktime: 2100},
+		SeqLeg:       nil, // taker never funded
+		Secret:       secret,
+		HashH:        h[:],
+		SeqClaimKey:  mustKey(t),
+		BtcRefundKey: mustKey(t),
+		BtcLocktime:  2100,
+		SeqLocktime:  8240,
+		AssetHex:     testAsset,
+		BtcAmount:    25000,
+		SeqAmount:    5000000,
+		Timing:       XcTiming{Poll: 2 * time.Millisecond},
+	})
+	if err == nil || !errors.Is(err, ErrXcRefunded) {
+		t.Fatalf("want ErrXcRefunded, got %v", err)
+	}
+	if res.BtcRefundTx != "btc-refund" {
+		t.Fatalf("reverse resume did not refund BTC: %+v", res)
+	}
+}

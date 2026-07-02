@@ -374,11 +374,29 @@ func resumeCrossSessions(dir, btcRPCURL, btcWallet, btcChainName, seqRPCURL, seq
 			continue
 		}
 		if st.Direction == "reverse" {
-			// Reverse resume (maker holds the secret; claim the taker's SEQ leg or
-			// refund our BTC leg after T_btc) is not wired yet; surface it so an
-			// operator can act rather than silently leaving funds.
-			fmt.Printf("%s: reverse session — resume not yet implemented; state has the secret + keys for manual recovery (btc_leg %s, T_btc %d)\n",
-				name, st.BtcLegTxid, st.BtcLocktime)
+			if st.BtcLegTxid == "" || st.BtcLegScriptHex == "" || st.BtcRefundPrivHex == "" || st.SecretHex == "" {
+				fmt.Printf("%s: reverse session with no funded BTC leg / secret to recover; skipping\n", name)
+				continue
+			}
+			rp, rerr := resumeParamsFromStateReverse(&st, btcChain, seqChain, spendFee, dir)
+			if rerr != nil {
+				fmt.Printf("%s: reverse reconstruct: %v\n", name, rerr)
+				continue
+			}
+			wg.Add(1)
+			go func(name string, rp client.MakerReverseResumeParams) {
+				defer wg.Done()
+				fmt.Printf("%s: resuming reverse session (claim asset if funded, else refund BTC after T_btc)\n", name)
+				res, rerr := client.ResumeMakerReverse(rp)
+				if rerr != nil {
+					fmt.Printf("%s: reverse resume ended: %v\n", name, rerr)
+					if res != nil && res.BtcRefundTx != "" {
+						fmt.Printf("%s: BTC leg refunded in %s\n", name, res.BtcRefundTx)
+					}
+					return
+				}
+				fmt.Printf("%s: REVERSE RESUMED + SETTLED: claimed the asset in %s\n", name, res.SeqClaimTxid)
+			}(name, rp)
 			continue
 		}
 		if st.SeqLegTxid == "" || st.SeqLegScriptHex == "" || st.BtcClaimPrivHex == "" || st.SeqRefundPrivHex == "" {
@@ -464,6 +482,75 @@ func resumeParamsFromState(st *xmakerSessionState, btcChain *xchain.BitcoinChain
 		},
 		Log: func(format string, args ...interface{}) { fmt.Printf("session "+sid+": "+format+"\n", args...) },
 	}, nil
+}
+
+// resumeParamsFromStateReverse rebuilds a reverse resume from a persisted record.
+// The taker's asset leg may be absent (taker never funded) — resume then just
+// refunds our BTC leg after T_btc.
+func resumeParamsFromStateReverse(st *xmakerSessionState, btcChain *xchain.BitcoinChain, seqChain *xchain.Chain,
+	spendFee uint64, dir string) (client.MakerReverseResumeParams, error) {
+	var zero client.MakerReverseResumeParams
+	hashH, err := hex.DecodeString(st.HashHex)
+	if err != nil || len(hashH) != 32 {
+		return zero, fmt.Errorf("bad hash_hex")
+	}
+	secret, err := hex.DecodeString(st.SecretHex)
+	if err != nil || len(secret) != 32 {
+		return zero, fmt.Errorf("bad secret_hex")
+	}
+	seqClaimBytes, err := hex.DecodeString(st.SeqClaimPrivHex)
+	if err != nil {
+		return zero, fmt.Errorf("bad seq_claim_priv_hex")
+	}
+	btcRefundBytes, err := hex.DecodeString(st.BtcRefundPrivHex)
+	if err != nil {
+		return zero, fmt.Errorf("bad btc_refund_priv_hex")
+	}
+	btcScript, err := hex.DecodeString(st.BtcLegScriptHex)
+	if err != nil {
+		return zero, fmt.Errorf("bad btc_leg_script_hex")
+	}
+	sid := st.SessionID
+	rp := client.MakerReverseResumeParams{
+		// The maker holds the secret, so the ops swap is built from it.
+		Ops: &client.LiveXcOps{
+			Swap: xchain.NewSwapBitcoin(btcChain, seqChain, xchain.NewHashLock(secret)),
+			BTC:  btcChain, SEQ: seqChain,
+		},
+		BtcLeg: &xchain.LegLock{
+			Script:   btcScript,
+			Funded:   &xchain.FundedHTLC{TxID: st.BtcLegTxid, Vout: st.BtcLegVout, Amount: st.BtcLegAmount},
+			Locktime: st.BtcLocktime,
+		},
+		SeqBlockHash: st.SeqBlockHash,
+		Secret:       secret,
+		HashH:        hashH,
+		SeqClaimKey:  xchain.KeyFromBytes(seqClaimBytes),
+		BtcRefundKey: xchain.KeyFromBytes(btcRefundBytes),
+		BtcLocktime:  st.BtcLocktime,
+		SeqLocktime:  st.SeqLocktime,
+		AssetHex:     st.SeqLegAsset,
+		BtcAmount:    st.BtcLegAmount,
+		SeqAmount:    st.SeqLegAmount,
+		SpendFeeSats: spendFee,
+		OnUpdate: func(r *client.MakerReverseResult) {
+			persistXSessionReverse(dir, sid, st.OfferID, r)
+		},
+		Log: func(format string, args ...interface{}) { fmt.Printf("session "+sid+": "+format+"\n", args...) },
+	}
+	// The taker's asset leg is present only if it was funded + verified.
+	if st.SeqLegTxid != "" && st.SeqLegScriptHex != "" {
+		seqScript, serr := hex.DecodeString(st.SeqLegScriptHex)
+		if serr != nil {
+			return zero, fmt.Errorf("bad seq_leg_script_hex")
+		}
+		rp.SeqLeg = &xchain.LegLock{
+			Script:   seqScript,
+			Funded:   &xchain.FundedHTLC{TxID: st.SeqLegTxid, Vout: st.SeqLegVout, Amount: st.SeqLegAmount, AssetID: st.SeqLegAsset},
+			Locktime: st.SeqLocktime,
+		}
+	}
+	return rp, nil
 }
 
 // swapReqAdapter adapts a seqob *seqdexv1.SwapRequest to ports.SwapRequest. The
